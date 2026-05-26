@@ -1,0 +1,15 @@
+[package]
+name = "population-density-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytemuck.workspace = true
+clap.workspace = true
+memmap2.workspace = true
+population-density = { path = "../core" }
+rayon.workspace = true
+rustc-hash.workspace = true
+s2.workspace = true
+tiff.workspace = true

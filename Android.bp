@@ -1,0 +1,12 @@
+rust_library {
+    name: "libpopulation_density",
+    crate_name: "population_density",
+    srcs: ["core/src/lib.rs"],
+    rustlibs: [
+        "libanyhow",
+        "libbytemuck",
+        "libmemmap2",
+    ],
+    edition: "2024",
+}
+
