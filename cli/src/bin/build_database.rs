@@ -514,6 +514,37 @@ fn validate_georeferencing<R: std::io::Read + std::io::Seek>(
     Ok(())
 }
 
+/// Extracts the leaves of the pruned quadtree for all S2 faces, requiring every face to yield at
+/// least one leaf. Returns an error if any face's total population is below the threshold, since a
+/// whole face with no cells would leave that region with no coarsening cell on-device.
+fn extract_pruned_leaves(cell_populations: &FxHashMap<u64, i64>) -> Result<Vec<u64>> {
+    let face_ids: Vec<u64> = (0..NUM_ROOT_FACES)
+        .map(|face| ((face as u64) << S2_FACE_SHIFT) | (1u64 << LEVEL_0_SENTINEL_SHIFT))
+        .collect();
+    let mut leaves = Vec::new();
+
+    for (face, &face_id) in face_ids.iter().enumerate() {
+        let leaves_before = leaves.len();
+        find_leaves(face_id, 0, cell_populations, &mut leaves);
+        // Every S2 face must yield at least one leaf. Density-based coarse location relies on every
+        // valid coordinate resolving to a cell (a face-level cell at worst); an empty face would
+        // make the on-device query return no cell for that whole region, which the framework treats
+        // as "no coarse location". Fail loudly so a future GeoTIFF or threshold change can't
+        // silently empty a face and turn that suppression into a normal user-facing outcome.
+        if leaves.len() == leaves_before {
+            return Err(anyhow!(
+                "S2 face {} produced no leaves: its total population is below the threshold ({}). \
+                 A valid Earth-scale dataset populates every face — the input GeoTIFF or the \
+                 threshold is wrong.",
+                face,
+                POPULATION_THRESHOLD
+            ));
+        }
+    }
+
+    Ok(leaves)
+}
+
 /// Runs the database build pipeline to compile S2 population density database from GeoTIFF.
 fn main() -> Result<()> {
     let arguments = Arguments::parse();
@@ -653,14 +684,7 @@ fn main() -> Result<()> {
     );
     let extraction_start_time = Instant::now();
 
-    let face_ids: Vec<u64> = (0..NUM_ROOT_FACES)
-        .map(|face| ((face as u64) << S2_FACE_SHIFT) | (1u64 << LEVEL_0_SENTINEL_SHIFT))
-        .collect();
-    let mut leaves = Vec::new();
-
-    for &face_id in &face_ids {
-        find_leaves(face_id, 0, &cell_populations, &mut leaves);
-    }
+    let mut leaves = extract_pruned_leaves(&cell_populations)?;
 
     println!(
         "Step 3 completed in {:.2?}.",
@@ -735,5 +759,34 @@ mod tests {
         if database_path.exists() {
             let _ = std::fs::remove_file(&database_path);
         }
+    }
+
+    /// Verifies that leaf extraction requires every S2 face to be populated, failing loudly if any
+    /// face is empty (which would leave a whole region with no coarsening cell on-device).
+    #[test]
+    fn test_extract_pruned_leaves_requires_every_face() {
+        use population_density::POPULATION_THRESHOLD_FIXED;
+
+        // All six faces populated at the face level: one leaf each.
+        let mut populations = FxHashMap::default();
+        for face in 0..NUM_ROOT_FACES {
+            let face_id = ((face as u64) << S2_FACE_SHIFT) | (1u64 << LEVEL_0_SENTINEL_SHIFT);
+            populations.insert(face_id, POPULATION_THRESHOLD_FIXED);
+        }
+        let leaves =
+            extract_pruned_leaves(&populations).expect("all faces populated should succeed");
+        assert_eq!(leaves.len(), NUM_ROOT_FACES as usize);
+
+        // Dropping one face's population must make extraction fail loudly.
+        let dropped_face_id = (0u64 << S2_FACE_SHIFT) | (1u64 << LEVEL_0_SENTINEL_SHIFT);
+        populations.remove(&dropped_face_id);
+        let result = extract_pruned_leaves(&populations);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("produced no leaves")
+        );
     }
 }

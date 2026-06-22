@@ -444,7 +444,8 @@ fn test_builder_empty_build_fails_fast() {
     std::fs::create_dir_all("scratch/adversarial").unwrap();
 
     // Create a 2x2 mock TIFF where all population density pixel values are 0.0f32.
-    // They will not cross POPULATION_THRESHOLD, resulting in zero database leaves.
+    // They will not cross POPULATION_THRESHOLD, so no S2 face is populated and the per-face
+    // coverage check aborts the build on the very first empty face (face 0).
     let pixel_data = [0.0f32, 0.0f32, 0.0f32, 0.0f32];
     write_mock_tiff(&tiff_path, 2, 2, &pixel_data);
 
@@ -467,23 +468,40 @@ fn test_builder_empty_build_fails_fast() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("no valid population data found to build a database"));
+    assert!(
+        stderr.contains("S2 face 0 produced no leaves"),
+        "empty build must fail fast on the first empty S2 face; stderr: {}",
+        stderr
+    );
 
     // Cleanup files.
     let _ = std::fs::remove_file(tiff_path);
     let _ = std::fs::remove_file(database_path);
 }
 
-/// Verifies that non-finite float inputs (NaN, Infinity) are skipped and valid ones propagate successfully.
+/// Verifies that non-finite and out-of-range float inputs (NaN, infinity, negatives) are skipped
+/// during aggregation, leaving only the single valid pixel counted in the in-memory aggregation
+/// the build reports before it fails the per-face coverage check.
 #[test]
 fn test_builder_non_finite_float_inputs() {
+    const SAMPLE_ROW_SPACING: usize = 120;
+    const NAN_PIXEL_ROW: usize = 0;
+    const INFINITY_PIXEL_ROW: usize = SAMPLE_ROW_SPACING;
+    const NEGATIVE_PIXEL_ROW: usize = SAMPLE_ROW_SPACING * 2;
+    const VALID_PIXEL_ROW: usize = SAMPLE_ROW_SPACING * 3;
+    const MOCK_TIFF_HEIGHT: usize = VALID_PIXEL_ROW + 1;
+
     let tiff_path = PathBuf::from("scratch/adversarial/non_finite_mock.tif");
     let database_path = PathBuf::from("scratch/adversarial/non_finite_mock.bin");
     std::fs::create_dir_all("scratch/adversarial").unwrap();
 
-    // Create a 2x2 mock TIFF with NaN, positive Infinity, a negative value, and a valid population density pixel.
-    let pixel_data = [f32::NAN, f32::INFINITY, -100.0f32, 1500.0f32];
-    write_mock_tiff(&tiff_path, 2, 2, &pixel_data);
+    // Space each nonzero sample one degree apart so every value maps to a distinct level 12 cell.
+    let mut pixel_data = [0.0f32; MOCK_TIFF_HEIGHT];
+    pixel_data[NAN_PIXEL_ROW] = f32::NAN;
+    pixel_data[INFINITY_PIXEL_ROW] = f32::INFINITY;
+    pixel_data[NEGATIVE_PIXEL_ROW] = -100.0;
+    pixel_data[VALID_PIXEL_ROW] = 1500.0;
+    write_mock_tiff(&tiff_path, 1, MOCK_TIFF_HEIGHT as u32, &pixel_data);
 
     // Run the build_database binary.
     let output = Command::new("cargo")
@@ -502,14 +520,28 @@ fn test_builder_non_finite_float_inputs() {
         .output()
         .expect("Failed to execute cargo run");
 
-    assert!(output.status.success());
+    // The finite/positive filter must skip NaN, +Infinity, and the negative value, leaving exactly
+    // the single valid pixel — so aggregation reports one populated level 12 cell. A single valid
+    // pixel populates only one S2 face, so the per-face coverage check then rejects the single-face
+    // build. A small georeferenced GeoTIFF cannot span all six faces, so this fast-fail (rather than
+    // a successful single-face database) is the correct outcome and it still proves the bad floats
+    // were dropped: without the filter the count would differ or the build would crash.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Total populated level 12 cells: 1\n"),
+        "non-finite and negative pixels must be skipped, leaving exactly one populated cell; stdout: {}",
+        stdout
+    );
 
-    // Verify that the generated database successfully contains exactly the 1 valid leaf cell,
-    // demonstrating that the other 3 non-finite/invalid float inputs were completely skipped.
-    let engine = QueryEngine::new(&database_path).unwrap();
-    assert_eq!(engine.count(), 1);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("produced no leaves"),
+        "single-face build must be rejected by the per-face coverage check; stderr: {}",
+        stderr
+    );
 
-    // Cleanup files.
+    // Cleanup files (the database is never written because the build fails fast).
     let _ = std::fs::remove_file(tiff_path);
     let _ = std::fs::remove_file(database_path);
 }
