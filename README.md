@@ -22,6 +22,24 @@ Verify the downloaded file with `sha256sum` before building — the deterministi
 
 The build pipeline aggregates pixel coordinates into level 12 S2 cell IDs in parallel using rayon, propagates population values up the S2 quadtree, and prunes cells with population counts below the 1,000 person threshold. The remaining cells are then compact-serialized into the final flat block-compressed database format.
 
+## Building and verifying the database
+
+With the pinned input GeoTIFF placed at `data/global_pop_2026_CN_1km_R2025A_UA_v1.tif` (see [Data source](#data-source)), build the database:
+
+```bash
+cargo run --release --package population-density-cli --bin build_database
+```
+
+This writes `population_density_database.bin`. The build is deterministic, so the same input always produces the same output bytes. Verify the result against the shipped database:
+
+* **Output SHA-256**: `33aed37b6f0de0494873eb58129c1bdc17f69e111efdc5a9f2f74379a58647a9`
+
+```bash
+sha256sum population_density_database.bin
+```
+
+The printed digest must equal the value above. That value is the digest of the database shipped at `packages/apps/NetworkLocation/res/raw/population_density_database.bin`, so a rebuild that matches it confirms the shipped blob is the legitimate deterministic build output of the pinned input rather than a stale or tampered file. A mismatch means the input GeoTIFF, the build toolchain, or the shipped blob has changed, and must be investigated before release.
+
 ## Database purpose
 
 The generated database is used for the GrapheneOS system population density provider to protect user location privacy.
