@@ -514,6 +514,53 @@ fn validate_georeferencing<R: std::io::Read + std::io::Seek>(
     Ok(())
 }
 
+/// Converts a population value to fixed-point units.
+fn convert_population_to_fixed(population: f32) -> Result<i64> {
+    if !population.is_finite() || population < 0.0 {
+        return Err(anyhow!(
+            "population value must be finite and non-negative: {}",
+            population
+        ));
+    }
+
+    let fixed_population = (population as f64 * POPULATION_FIXED_POINT_SCALE as f64).round();
+    if fixed_population >= i64::MAX as f64 {
+        return Err(anyhow!(
+            "population value {} exceeds the fixed-point range",
+            population
+        ));
+    }
+
+    Ok(fixed_population as i64)
+}
+
+/// Adds a non-negative fixed-point population to an S2 cell.
+fn add_population(
+    cell_populations: &mut FxHashMap<u64, i64>,
+    cell_id: u64,
+    population: i64,
+) -> Result<()> {
+    if population < 0 {
+        return Err(anyhow!(
+            "population increment must be non-negative: {}",
+            population
+        ));
+    }
+
+    let accumulated_population = cell_populations.entry(cell_id).or_insert(0);
+    *accumulated_population = accumulated_population
+        .checked_add(population)
+        .ok_or_else(|| {
+            anyhow!(
+                "fixed-point population overflow for S2 cell {:016x}: {} + {}",
+                cell_id,
+                accumulated_population,
+                population
+            )
+        })?;
+    Ok(())
+}
+
 /// Extracts the leaves of the pruned quadtree for all S2 faces, requiring every face to yield at
 /// least one leaf. Returns an error if any face's total population is below the threshold, since a
 /// whole face with no cells would leave that region with no coarsening cell on-device.
@@ -608,7 +655,7 @@ fn main() -> Result<()> {
     let width_usize = width as usize;
     let level_12_populations = (0..height as usize)
         .into_par_iter()
-        .fold(FxHashMap::default, |mut local_map, pixel_y| {
+        .try_fold(FxHashMap::default, |mut local_map, pixel_y| -> Result<_> {
             let row_offset = pixel_y * width_usize;
             let pixel_y_float = pixel_y as f64;
             for pixel_x in 0..width_usize {
@@ -623,18 +670,21 @@ fn main() -> Result<()> {
                     // Accumulate in fixed-point integer units so the parallel reduction is
                     // associative and the build is bit-for-bit reproducible regardless of the
                     // rayon work-stealing split (f64 addition is not associative).
-                    *local_map.entry(cell_id.0).or_insert(0i64) +=
-                        (value as f64 * POPULATION_FIXED_POINT_SCALE as f64).round() as i64;
+                    let fixed_population = convert_population_to_fixed(value)?;
+                    add_population(&mut local_map, cell_id.0, fixed_population)?;
                 }
             }
-            local_map
+            Ok(local_map)
         })
-        .reduce(FxHashMap::default, |mut accumulator_map, local_map| {
-            for (cell_id, population) in local_map {
-                *accumulator_map.entry(cell_id).or_insert(0) += population;
-            }
-            accumulator_map
-        });
+        .try_reduce(
+            FxHashMap::default,
+            |mut accumulator_map, local_map| -> Result<_> {
+                for (cell_id, population) in local_map {
+                    add_population(&mut accumulator_map, cell_id, population)?;
+                }
+                Ok(accumulator_map)
+            },
+        )?;
 
     println!(
         "Aggregation completed in {:.2?}.",
@@ -660,7 +710,7 @@ fn main() -> Result<()> {
         for &cell_id in &current_level_cells {
             let parent_id = get_parent_id(cell_id, level);
             let population = *cell_populations.get(&cell_id).unwrap_or(&0);
-            *cell_populations.entry(parent_id).or_insert(0) += population;
+            add_population(&mut cell_populations, parent_id, population)?;
             parent_level_cells.push(parent_id);
         }
         parent_level_cells.sort_unstable();
@@ -715,6 +765,65 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Verifies that population conversion preserves normal fixed-point values.
+    #[test]
+    fn test_convert_population_to_fixed() {
+        assert_eq!(convert_population_to_fixed(0.0).unwrap(), 0);
+        assert_eq!(
+            convert_population_to_fixed(1.0).unwrap(),
+            POPULATION_FIXED_POINT_SCALE
+        );
+        assert_eq!(
+            convert_population_to_fixed(1.5).unwrap(),
+            POPULATION_FIXED_POINT_SCALE + POPULATION_FIXED_POINT_SCALE / 2
+        );
+    }
+
+    /// Verifies that population conversion rejects values outside the fixed-point range.
+    #[test]
+    fn test_convert_population_to_fixed_rejects_out_of_range_values() {
+        const POPULATION_LIMIT_EXPONENT: u32 =
+            i64::BITS - 1 - POPULATION_FIXED_POINT_SCALE.trailing_zeros();
+        const FIRST_OUT_OF_RANGE_POPULATION: f32 = (1u64 << POPULATION_LIMIT_EXPONENT) as f32;
+
+        let largest_in_range_population =
+            f32::from_bits(FIRST_OUT_OF_RANGE_POPULATION.to_bits() - 1);
+        assert!(convert_population_to_fixed(largest_in_range_population).is_ok());
+
+        for out_of_range_population in [FIRST_OUT_OF_RANGE_POPULATION, f32::MAX] {
+            let result = convert_population_to_fixed(out_of_range_population);
+            assert!(result.is_err());
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("exceeds the fixed-point range")
+            );
+        }
+    }
+
+    /// Verifies that population accumulation accepts the maximum value and rejects overflow.
+    #[test]
+    fn test_add_population_boundaries() {
+        const CELL_ID: u64 = 0x1000000000000000;
+
+        let mut cell_populations = FxHashMap::default();
+        cell_populations.insert(CELL_ID, i64::MAX - 1);
+
+        add_population(&mut cell_populations, CELL_ID, 1).unwrap();
+        assert_eq!(cell_populations[&CELL_ID], i64::MAX);
+
+        let result = add_population(&mut cell_populations, CELL_ID, 1);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("fixed-point population overflow")
+        );
+        assert_eq!(cell_populations[&CELL_ID], i64::MAX);
+    }
 
     /// Verifies that writing an empty set of compact leaves fails fast.
     #[test]

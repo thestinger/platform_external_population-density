@@ -546,6 +546,49 @@ fn test_builder_non_finite_float_inputs() {
     let _ = std::fs::remove_file(database_path);
 }
 
+/// Verifies that fixed-point population accumulation fails instead of overflowing.
+#[test]
+fn test_builder_fixed_point_population_overflow() {
+    const OVERFLOWING_POPULATION_PER_PIXEL: f32 = 5_000_000_000_000.0;
+
+    let tiff_path = PathBuf::from("scratch/adversarial/population_overflow_mock.tif");
+    let database_path = PathBuf::from("scratch/adversarial/population_overflow_mock.bin");
+    std::fs::create_dir_all("scratch/adversarial").unwrap();
+
+    let pixel_data = [
+        OVERFLOWING_POPULATION_PER_PIXEL,
+        OVERFLOWING_POPULATION_PER_PIXEL,
+    ];
+    write_mock_tiff(&tiff_path, 2, 1, &pixel_data);
+
+    let output = Command::new("cargo")
+        .args([
+            "run",
+            "--package",
+            "population-density-cli",
+            "--bin",
+            "build_database",
+            "--",
+            "--tiff-path",
+            tiff_path.to_str().unwrap(),
+            "--database-path",
+            database_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to execute cargo run");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("fixed-point population overflow"),
+        "builder must reject overflowing population accumulation; stderr: {}",
+        stderr
+    );
+
+    let _ = std::fs::remove_file(tiff_path);
+    let _ = std::fs::remove_file(database_path);
+}
+
 /// Executes the compiled unit tests inside the database builder binary to verify its internal invariants.
 #[test]
 fn test_builder_unit_tests() {
