@@ -15,6 +15,28 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tiff::encoder::{TiffEncoder, colortype};
 
+/// Removes a file if it exists.
+fn remove_file_if_present(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Removes a temporary file during drop and fails unless already unwinding.
+fn remove_file_on_drop(path: &Path) {
+    if let Err(error) = remove_file_if_present(path) {
+        if std::thread::panicking() {
+            return;
+        }
+        panic!(
+            "failed to remove temporary file '{}': {error}",
+            path.display()
+        );
+    }
+}
+
 /// Manages automatic cleanup of temporary test databases.
 struct TempDatabase {
     path: PathBuf,
@@ -62,8 +84,62 @@ impl TempDatabase {
 impl Drop for TempDatabase {
     /// Deletes the temporary file upon drop.
     fn drop(&mut self) {
-        if self.path.exists() {
-            let _ = std::fs::remove_file(&self.path);
+        remove_file_on_drop(&self.path);
+    }
+}
+
+/// Manages cleanup of a builder test's temporary input and output files.
+struct BuilderTestFiles {
+    tiff_path: PathBuf,
+    database_path: PathBuf,
+    cleaned: bool,
+}
+
+impl BuilderTestFiles {
+    /// Creates unique temporary paths for a builder test.
+    fn new(name: &str) -> Self {
+        let scratch_path = Path::new("scratch/adversarial");
+        std::fs::create_dir_all(scratch_path).unwrap();
+        let file_name_prefix = format!("{}-{name}", std::process::id());
+        Self {
+            tiff_path: scratch_path.join(format!("{file_name_prefix}.tif")),
+            database_path: scratch_path.join(format!("{file_name_prefix}.bin")),
+            cleaned: false,
+        }
+    }
+
+    /// Returns the temporary GeoTIFF path.
+    fn tiff_path(&self) -> &Path {
+        &self.tiff_path
+    }
+
+    /// Returns the temporary database path.
+    fn database_path(&self) -> &Path {
+        &self.database_path
+    }
+
+    /// Removes both temporary files and fails on unexpected cleanup errors.
+    fn cleanup(mut self) {
+        for path in [&self.tiff_path, &self.database_path] {
+            remove_file_if_present(path).unwrap_or_else(|error| {
+                panic!(
+                    "failed to remove temporary file '{}': {error}",
+                    path.display()
+                )
+            });
+        }
+        self.cleaned = true;
+    }
+}
+
+impl Drop for BuilderTestFiles {
+    /// Removes temporary files if explicit cleanup is bypassed by unwinding.
+    fn drop(&mut self) {
+        if self.cleaned {
+            return;
+        }
+        for path in [&self.tiff_path, &self.database_path] {
+            remove_file_on_drop(path);
         }
     }
 }
@@ -439,15 +515,13 @@ fn test_engine_rejects_duplicate_or_out_of_order_headers() {
 /// Verifies that the database builder fails fast when empty/zero-element builds are attempted.
 #[test]
 fn test_builder_empty_build_fails_fast() {
-    let tiff_path = PathBuf::from("scratch/adversarial/empty_mock.tif");
-    let database_path = PathBuf::from("scratch/adversarial/empty_mock.bin");
-    std::fs::create_dir_all("scratch/adversarial").unwrap();
+    let files = BuilderTestFiles::new("empty_mock");
 
     // Create a 2x2 mock TIFF where all population density pixel values are 0.0f32.
     // They will not cross POPULATION_THRESHOLD, so no S2 face is populated and the per-face
     // coverage check aborts the build on the very first empty face (face 0).
     let pixel_data = [0.0f32, 0.0f32, 0.0f32, 0.0f32];
-    write_mock_tiff(&tiff_path, 2, 2, &pixel_data);
+    write_mock_tiff(files.tiff_path(), 2, 2, &pixel_data);
 
     // Run the build_database binary.
     let output = Command::new("cargo")
@@ -459,9 +533,9 @@ fn test_builder_empty_build_fails_fast() {
             "build_database",
             "--",
             "--tiff-path",
-            tiff_path.to_str().unwrap(),
+            files.tiff_path().to_str().unwrap(),
             "--database-path",
-            database_path.to_str().unwrap(),
+            files.database_path().to_str().unwrap(),
         ])
         .output()
         .expect("Failed to execute cargo run");
@@ -474,9 +548,7 @@ fn test_builder_empty_build_fails_fast() {
         stderr
     );
 
-    // Cleanup files.
-    let _ = std::fs::remove_file(tiff_path);
-    let _ = std::fs::remove_file(database_path);
+    files.cleanup();
 }
 
 /// Verifies that non-finite and out-of-range float inputs (NaN, infinity, negatives) are skipped
@@ -491,9 +563,7 @@ fn test_builder_non_finite_float_inputs() {
     const VALID_PIXEL_ROW: usize = SAMPLE_ROW_SPACING * 3;
     const MOCK_TIFF_HEIGHT: usize = VALID_PIXEL_ROW + 1;
 
-    let tiff_path = PathBuf::from("scratch/adversarial/non_finite_mock.tif");
-    let database_path = PathBuf::from("scratch/adversarial/non_finite_mock.bin");
-    std::fs::create_dir_all("scratch/adversarial").unwrap();
+    let files = BuilderTestFiles::new("non_finite_mock");
 
     // Space each nonzero sample one degree apart so every value maps to a distinct level 12 cell.
     let mut pixel_data = [0.0f32; MOCK_TIFF_HEIGHT];
@@ -501,7 +571,7 @@ fn test_builder_non_finite_float_inputs() {
     pixel_data[INFINITY_PIXEL_ROW] = f32::INFINITY;
     pixel_data[NEGATIVE_PIXEL_ROW] = -100.0;
     pixel_data[VALID_PIXEL_ROW] = 1500.0;
-    write_mock_tiff(&tiff_path, 1, MOCK_TIFF_HEIGHT as u32, &pixel_data);
+    write_mock_tiff(files.tiff_path(), 1, MOCK_TIFF_HEIGHT as u32, &pixel_data);
 
     // Run the build_database binary.
     let output = Command::new("cargo")
@@ -513,9 +583,9 @@ fn test_builder_non_finite_float_inputs() {
             "build_database",
             "--",
             "--tiff-path",
-            tiff_path.to_str().unwrap(),
+            files.tiff_path().to_str().unwrap(),
             "--database-path",
-            database_path.to_str().unwrap(),
+            files.database_path().to_str().unwrap(),
         ])
         .output()
         .expect("Failed to execute cargo run");
@@ -541,9 +611,7 @@ fn test_builder_non_finite_float_inputs() {
         stderr
     );
 
-    // Cleanup files (the database is never written because the build fails fast).
-    let _ = std::fs::remove_file(tiff_path);
-    let _ = std::fs::remove_file(database_path);
+    files.cleanup();
 }
 
 /// Verifies that fixed-point population accumulation fails instead of overflowing.
@@ -551,15 +619,13 @@ fn test_builder_non_finite_float_inputs() {
 fn test_builder_fixed_point_population_overflow() {
     const OVERFLOWING_POPULATION_PER_PIXEL: f32 = 5_000_000_000_000.0;
 
-    let tiff_path = PathBuf::from("scratch/adversarial/population_overflow_mock.tif");
-    let database_path = PathBuf::from("scratch/adversarial/population_overflow_mock.bin");
-    std::fs::create_dir_all("scratch/adversarial").unwrap();
+    let files = BuilderTestFiles::new("population_overflow_mock");
 
     let pixel_data = [
         OVERFLOWING_POPULATION_PER_PIXEL,
         OVERFLOWING_POPULATION_PER_PIXEL,
     ];
-    write_mock_tiff(&tiff_path, 2, 1, &pixel_data);
+    write_mock_tiff(files.tiff_path(), 2, 1, &pixel_data);
 
     let output = Command::new("cargo")
         .args([
@@ -570,9 +636,9 @@ fn test_builder_fixed_point_population_overflow() {
             "build_database",
             "--",
             "--tiff-path",
-            tiff_path.to_str().unwrap(),
+            files.tiff_path().to_str().unwrap(),
             "--database-path",
-            database_path.to_str().unwrap(),
+            files.database_path().to_str().unwrap(),
         ])
         .output()
         .expect("failed to execute cargo run");
@@ -585,8 +651,7 @@ fn test_builder_fixed_point_population_overflow() {
         stderr
     );
 
-    let _ = std::fs::remove_file(tiff_path);
-    let _ = std::fs::remove_file(database_path);
+    files.cleanup();
 }
 
 /// Executes the compiled unit tests inside the database builder binary to verify its internal invariants.
