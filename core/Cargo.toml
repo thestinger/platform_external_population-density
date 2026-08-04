@@ -5,11 +5,11 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-bytemuck.workspace = true
 memmap2.workspace = true
 
 [dev-dependencies]
 rayon.workspace = true
 rustc-hash.workspace = true
 s2.workspace = true
+tempfile.workspace = true
 tiff.workspace = true

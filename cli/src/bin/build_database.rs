@@ -4,26 +4,24 @@
 //! level 12 S2 cells in parallel, propagates the values up the quadtree, and prunes
 //! cells below the population threshold to generate a compact database.
 
-#![allow(clippy::needless_range_loop, clippy::collapsible_if)]
-
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use population_density::{
-    BLOCK_HEADER_SIZE, BLOCK_SIZE, EXCEPTION_INDEX_BITMASK_SIZE, EXCEPTION_MODE_U4,
-    EXCEPTION_MODE_U8, EXCEPTION_MODE_U16, EXCEPTION_MODE_U32, LAST_SUB_BLOCK_SIZE, MAX_DB_LEVEL,
-    MAX_PFOR_BIT_WIDTH, NUM_ROOT_FACES, POPULATION_FIXED_POINT_SCALE, POPULATION_THRESHOLD,
-    S2_FACE_SHIFT, S2PP_CHECKPOINT_INTERVAL, SHIFT_COMPACT, SUB_BLOCK_BIT_WIDTH_BITS,
-    SUB_BLOCK_COUNT, SUB_BLOCK_SIZE, get_parent_id,
+    MAX_DB_LEVEL, NUM_ROOT_FACES, POPULATION_THRESHOLD, S2_FACE_SHIFT, SHIFT_COMPACT, get_parent_id,
 };
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use s2::cellid::CellID;
 use s2::latlng::LatLng;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::io::BufReader;
+use std::path::PathBuf;
 use std::time::Instant;
 use tiff::decoder::{Decoder, DecodingResult, Limits};
+
+use population_density_cli::{
+    add_population, convert_population_to_fixed, open_database_snapshot, write_topology_database,
+};
 
 #[path = "../geotiff.rs"]
 mod geotiff;
@@ -31,9 +29,6 @@ mod geotiff;
 mod quadtree;
 
 use quadtree::{LEVEL_0_SENTINEL_SHIFT, find_leaves};
-
-/// Configures S2PP database formatting constants.
-const EXCEPTION_MODE_U4_MAX: u32 = 15;
 
 /// Configures GeoTIFF spatial parameters for coordinates and cell aggregation.
 const GEOTIFF_MAX_LATITUDE: f64 = 84.0;
@@ -52,7 +47,7 @@ const GEOREFERENCE_TOLERANCE: f64 = 1e-6;
     about = "Build the S2 population density database from GeoTIFF."
 )]
 struct Arguments {
-    /// Specifies the path to the input GeoTIFF file. Download source: https://hub.worldpop.org/geodata/summary?id=80032
+    /// Specifies the input GeoTIFF path.
     #[arg(
         long = "tiff-path",
         default_value = "data/global_pop_2026_CN_1km_R2025A_UA_v1.tif"
@@ -65,402 +60,6 @@ struct Arguments {
         default_value = "population_density_database.bin"
     )]
     database_path: PathBuf,
-}
-
-/// Writes the block-compressed S2PP PFOR database format to disk.
-fn write_s2pp_database<P: AsRef<Path>>(database_path: P, compact_leaves: &[u32]) -> Result<()> {
-    if compact_leaves.is_empty() {
-        return Err(anyhow!(
-            "no valid population data found to build a database"
-        ));
-    }
-    let start_time = Instant::now();
-    let count = compact_leaves.len();
-    let block_count = count.div_ceil(BLOCK_SIZE);
-
-    println!("Writing database in compact S2PP block-compressed S2 cell ID format...");
-    let mut block_headers = Vec::with_capacity(block_count);
-    let mut block_absolute_offsets = Vec::with_capacity(block_count);
-    let mut block_data = Vec::new();
-
-    let mut deltas_minus_one = Vec::with_capacity(BLOCK_SIZE);
-
-    for block_index in 0..block_count {
-        let start = block_index * BLOCK_SIZE;
-        let end = std::cmp::min(start + BLOCK_SIZE, count);
-
-        let header = compact_leaves[start];
-        block_headers.push(header);
-        block_absolute_offsets.push(block_data.len() as u32);
-
-        if end - start <= 1 {
-            // Skip storing deltas if block has only one element (its header).
-            continue;
-        }
-
-        let delta_count = end - start - 1;
-
-        // Compute deltas-minus-one.
-        deltas_minus_one.clear();
-        for element_index in start + 1..end {
-            let delta = compact_leaves[element_index]
-                .checked_sub(compact_leaves[element_index - 1])
-                .ok_or_else(|| {
-                    anyhow!(
-                        "compact leaves are out of order or duplicate: cell at {} is less than or equal to preceding cell",
-                        element_index
-                    )
-                })?;
-            let delta_minus_one = delta
-                .checked_sub(1)
-                .ok_or_else(|| anyhow!("duplicate compact leaf ID found"))?;
-            deltas_minus_one.push(delta_minus_one);
-        }
-
-        // Use dynamic programming (DP) to find the optimal sub-block bit-widths.
-        let mut best_cost = usize::MAX;
-        let mut best_mode = EXCEPTION_MODE_U32;
-        let mut best_exception_count = 0;
-        let mut best_bit_widths = [0u8; SUB_BLOCK_COUNT];
-
-        for &mode in &[
-            EXCEPTION_MODE_U4,
-            EXCEPTION_MODE_U8,
-            EXCEPTION_MODE_U16,
-            EXCEPTION_MODE_U32,
-        ] {
-            const DP_ROWS: usize = SUB_BLOCK_COUNT + 1;
-            let mut dp = [[usize::MAX; BLOCK_SIZE]; DP_ROWS];
-            let mut parent_exception_count = [[0u8; BLOCK_SIZE]; DP_ROWS];
-            let mut chosen_bit_width = [[0u8; BLOCK_SIZE]; DP_ROWS];
-
-            dp[0][0] = 0;
-
-            for sub_block_index in 0..SUB_BLOCK_COUNT {
-                let sb_start = std::cmp::min(sub_block_index * SUB_BLOCK_SIZE, delta_count);
-                let sb_end = std::cmp::min(
-                    sb_start
-                        + if sub_block_index == SUB_BLOCK_COUNT - 1 {
-                            LAST_SUB_BLOCK_SIZE
-                        } else {
-                            SUB_BLOCK_SIZE
-                        },
-                    delta_count,
-                );
-                let sb_len = sb_end - sb_start;
-
-                // Precompute each candidate bit-width's sub-block exception count and validity
-                // once. Both depend only on (mode, sub-block, bit-width), not on exception_count,
-                // so hoisting the scan out of the exception_count loop avoids rescanning the
-                // sub-block deltas for every reachable exception_count state.
-                let mut bit_width_exception_counts = [0usize; MAX_PFOR_BIT_WIDTH as usize + 1];
-                let mut bit_width_valid = [false; MAX_PFOR_BIT_WIDTH as usize + 1];
-                for bit_width in 0..=MAX_PFOR_BIT_WIDTH {
-                    let mut sub_block_exception_count = 0;
-                    let mut valid = true;
-                    let limit = 1u32 << bit_width;
-
-                    for &delta_minus_one in &deltas_minus_one[sb_start..sb_end] {
-                        if delta_minus_one >= limit {
-                            sub_block_exception_count += 1;
-                            let val = (delta_minus_one >> bit_width) - 1;
-                            match mode {
-                                EXCEPTION_MODE_U4 => {
-                                    if val > EXCEPTION_MODE_U4_MAX {
-                                        valid = false;
-                                        break;
-                                    }
-                                }
-                                EXCEPTION_MODE_U8 => {
-                                    if val > u8::MAX as u32 {
-                                        valid = false;
-                                        break;
-                                    }
-                                }
-                                EXCEPTION_MODE_U16 => {
-                                    if val > u16::MAX as u32 {
-                                        valid = false;
-                                        break;
-                                    }
-                                }
-                                EXCEPTION_MODE_U32 => {}
-                                _ => unreachable!(),
-                            }
-                        }
-                    }
-
-                    bit_width_valid[bit_width as usize] = valid;
-                    bit_width_exception_counts[bit_width as usize] = sub_block_exception_count;
-                }
-
-                for exception_count in 0..=delta_count {
-                    let current_cost = dp[sub_block_index][exception_count];
-                    if current_cost == usize::MAX {
-                        continue;
-                    }
-
-                    for bit_width in 0..=MAX_PFOR_BIT_WIDTH {
-                        if !bit_width_valid[bit_width as usize] {
-                            continue;
-                        }
-
-                        let next_exception_count =
-                            exception_count + bit_width_exception_counts[bit_width as usize];
-                        if next_exception_count <= delta_count {
-                            let added_bits = sb_len * bit_width as usize;
-                            let next_cost = current_cost + added_bits;
-                            if next_cost < dp[sub_block_index + 1][next_exception_count] {
-                                dp[sub_block_index + 1][next_exception_count] = next_cost;
-                                parent_exception_count[sub_block_index + 1][next_exception_count] =
-                                    exception_count as u8;
-                                chosen_bit_width[sub_block_index + 1][next_exception_count] =
-                                    bit_width;
-                            }
-                        }
-                    }
-                }
-            }
-
-            for exception_count in 0..=delta_count {
-                let bit_cost = dp[SUB_BLOCK_COUNT][exception_count];
-                if bit_cost == usize::MAX {
-                    continue;
-                }
-                let primary_bytes = bit_cost.div_ceil(8);
-                let index_cost_bytes = if exception_count >= EXCEPTION_INDEX_BITMASK_SIZE {
-                    EXCEPTION_INDEX_BITMASK_SIZE
-                } else {
-                    exception_count
-                };
-                let value_cost_bytes = match mode {
-                    EXCEPTION_MODE_U4 => exception_count.div_ceil(2),
-                    EXCEPTION_MODE_U8 => exception_count * std::mem::size_of::<u8>(),
-                    EXCEPTION_MODE_U16 => exception_count * std::mem::size_of::<u16>(),
-                    EXCEPTION_MODE_U32 => exception_count * std::mem::size_of::<u32>(),
-                    _ => unreachable!(),
-                };
-                let total_cost =
-                    BLOCK_HEADER_SIZE + primary_bytes + index_cost_bytes + value_cost_bytes;
-                if total_cost < best_cost {
-                    best_cost = total_cost;
-                    best_mode = mode;
-                    best_exception_count = exception_count;
-                    // Backtrack.
-                    let mut current_exception_count = exception_count;
-                    for sub_block_index in (0..SUB_BLOCK_COUNT).rev() {
-                        best_bit_widths[sub_block_index] =
-                            chosen_bit_width[sub_block_index + 1][current_exception_count];
-                        current_exception_count = parent_exception_count[sub_block_index + 1]
-                            [current_exception_count]
-                            as usize;
-                    }
-                }
-            }
-        }
-
-        // 1. Write the 12-byte block header metadata.
-        let mut header_bytes = [0u8; BLOCK_HEADER_SIZE];
-        let mut bit_offset = 0;
-        for &bit_width in &best_bit_widths {
-            let mut bits_left = SUB_BLOCK_BIT_WIDTH_BITS;
-            let mut val = bit_width;
-            while bits_left > 0 {
-                let byte_idx = bit_offset / 8;
-                let bit_idx = bit_offset % 8;
-                let bits_to_write = std::cmp::min(8 - bit_idx, bits_left);
-                let mask = (1 << bits_to_write) - 1;
-                header_bytes[byte_idx] |= ((val & mask) << bit_idx) as u8;
-                val >>= bits_to_write;
-                bits_left -= bits_to_write;
-                bit_offset += bits_to_write;
-            }
-        }
-        header_bytes[BLOCK_HEADER_SIZE - 2] = best_exception_count as u8;
-        let index_bitmask_flag = if best_exception_count >= EXCEPTION_INDEX_BITMASK_SIZE {
-            1
-        } else {
-            0
-        };
-        header_bytes[BLOCK_HEADER_SIZE - 1] = best_mode | (index_bitmask_flag << 2);
-        block_data.extend_from_slice(&header_bytes);
-
-        // 2. Pack primary bitstream.
-        let mut primary_bitstream = Vec::new();
-        let mut current_byte = 0u8;
-        let mut primary_bit_offset = 0;
-
-        for sub_block_index in 0..SUB_BLOCK_COUNT {
-            let bit_width = best_bit_widths[sub_block_index] as usize;
-            if bit_width == 0 {
-                continue;
-            }
-            let sb_start = std::cmp::min(sub_block_index * SUB_BLOCK_SIZE, delta_count);
-            let sb_end = std::cmp::min(
-                sb_start
-                    + if sub_block_index == SUB_BLOCK_COUNT - 1 {
-                        LAST_SUB_BLOCK_SIZE
-                    } else {
-                        SUB_BLOCK_SIZE
-                    },
-                delta_count,
-            );
-            for &delta_minus_one in &deltas_minus_one[sb_start..sb_end] {
-                let mut val = delta_minus_one & ((1 << bit_width) - 1);
-                let mut bits_left = bit_width;
-                while bits_left > 0 {
-                    let bits_to_write = std::cmp::min(8 - primary_bit_offset, bits_left);
-                    let mask = (1 << bits_to_write) - 1;
-                    current_byte |= ((val & mask) as u8) << primary_bit_offset;
-                    val >>= bits_to_write;
-                    bits_left -= bits_to_write;
-                    primary_bit_offset += bits_to_write;
-                    if primary_bit_offset == 8 {
-                        primary_bitstream.push(current_byte);
-                        current_byte = 0;
-                        primary_bit_offset = 0;
-                    }
-                }
-            }
-        }
-        if primary_bit_offset > 0 {
-            primary_bitstream.push(current_byte);
-        }
-        block_data.extend_from_slice(&primary_bitstream);
-
-        // Collect the exceptions list.
-        let mut best_exceptions_list = Vec::with_capacity(best_exception_count);
-        for sub_block_index in 0..SUB_BLOCK_COUNT {
-            let bit_width = best_bit_widths[sub_block_index];
-            let sb_start = std::cmp::min(sub_block_index * SUB_BLOCK_SIZE, delta_count);
-            let sb_end = std::cmp::min(
-                sb_start
-                    + if sub_block_index == SUB_BLOCK_COUNT - 1 {
-                        LAST_SUB_BLOCK_SIZE
-                    } else {
-                        SUB_BLOCK_SIZE
-                    },
-                delta_count,
-            );
-            let limit = 1u32 << bit_width;
-            for delta_index in sb_start..sb_end {
-                let delta_minus_one = deltas_minus_one[delta_index];
-                if delta_minus_one >= limit {
-                    let val = (delta_minus_one >> bit_width) - 1;
-                    best_exceptions_list.push((delta_index as u8, val));
-                }
-            }
-        }
-        assert_eq!(best_exceptions_list.len(), best_exception_count);
-
-        // 3. Pack exception indices.
-        if index_bitmask_flag == 1 {
-            let mut bitmask = [0u8; EXCEPTION_INDEX_BITMASK_SIZE];
-            for &(delta_index, _) in &best_exceptions_list {
-                let idx = delta_index as usize;
-                bitmask[idx / 8] |= 1 << (idx % 8);
-            }
-            block_data.extend_from_slice(&bitmask);
-        } else {
-            for &(delta_index, _) in &best_exceptions_list {
-                block_data.push(delta_index);
-            }
-        }
-
-        // 4. Pack exception values.
-        match best_mode {
-            EXCEPTION_MODE_U4 => {
-                let num_u4_bytes = best_exception_count.div_ceil(2);
-                for byte_pair_index in 0..num_u4_bytes {
-                    let low_nibble_value = best_exceptions_list[2 * byte_pair_index].1;
-                    let high_nibble_value = if 2 * byte_pair_index + 1 < best_exception_count {
-                        best_exceptions_list[2 * byte_pair_index + 1].1
-                    } else {
-                        0
-                    };
-                    block_data.push((low_nibble_value | (high_nibble_value << 4)) as u8);
-                }
-            }
-            EXCEPTION_MODE_U8 => {
-                for exception_index in 0..best_exception_count {
-                    block_data.push(best_exceptions_list[exception_index].1 as u8);
-                }
-            }
-            EXCEPTION_MODE_U16 => {
-                for exception_index in 0..best_exception_count {
-                    block_data.extend_from_slice(
-                        &(best_exceptions_list[exception_index].1 as u16).to_le_bytes(),
-                    );
-                }
-            }
-            EXCEPTION_MODE_U32 => {
-                for exception_index in 0..best_exception_count {
-                    block_data
-                        .extend_from_slice(&best_exceptions_list[exception_index].1.to_le_bytes());
-                }
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    // Construct the two-level sparse offset tables.
-    let mut absolute_offsets = Vec::new();
-    let mut relative_offsets = Vec::with_capacity(block_count);
-    for block_index in 0..block_count {
-        if block_index % S2PP_CHECKPOINT_INTERVAL == 0 {
-            absolute_offsets.push(block_absolute_offsets[block_index]);
-        }
-        let checkpoint_index = block_index / S2PP_CHECKPOINT_INTERVAL;
-        let checkpoint_offset = block_absolute_offsets[checkpoint_index * S2PP_CHECKPOINT_INTERVAL];
-        let relative_offset = block_absolute_offsets[block_index] - checkpoint_offset;
-        if relative_offset > u16::MAX as u32 {
-            return Err(anyhow!(
-                "relative offset overflow: {} exceeds {}",
-                relative_offset,
-                u16::MAX
-            ));
-        }
-        relative_offsets.push(relative_offset as u16);
-    }
-
-    let database_path_ref = database_path.as_ref();
-    let temporary_path = database_path_ref.with_extension("tmp");
-    {
-        let file = File::create(&temporary_path)?;
-        let mut writer = BufWriter::new(file);
-
-        writer.write_all(b"S2PP")?;
-        writer.write_all(&(count as u32).to_le_bytes())?;
-        writer.write_all(&(BLOCK_SIZE as u32).to_le_bytes())?;
-        writer.write_all(&(block_count as u32).to_le_bytes())?;
-
-        for &header in &block_headers {
-            writer.write_all(&header.to_le_bytes())?;
-        }
-        for &absolute_offset in &absolute_offsets {
-            writer.write_all(&absolute_offset.to_le_bytes())?;
-        }
-        for &relative_offset in &relative_offsets {
-            writer.write_all(&relative_offset.to_le_bytes())?;
-        }
-        writer.write_all(&block_data)?;
-        writer.flush()?;
-    }
-
-    std::fs::rename(&temporary_path, database_path_ref)?;
-
-    println!(
-        "Compressed database written in {:.2?}.",
-        start_time.elapsed()
-    );
-    println!(
-        "Successfully generated database file: '{}'",
-        database_path_ref.display()
-    );
-    println!(
-        "File Size: {:.3} MB",
-        std::fs::metadata(database_path_ref)?.len() as f64 / (1024.0 * 1024.0)
-    );
-    Ok(())
 }
 
 /// Validates that the GeoTIFF origin and pixel scale match the assumed aggregation grid.
@@ -514,53 +113,6 @@ fn validate_georeferencing<R: std::io::Read + std::io::Seek>(
     Ok(())
 }
 
-/// Converts a population value to fixed-point units.
-fn convert_population_to_fixed(population: f32) -> Result<i64> {
-    if !population.is_finite() || population < 0.0 {
-        return Err(anyhow!(
-            "population value must be finite and non-negative: {}",
-            population
-        ));
-    }
-
-    let fixed_population = (population as f64 * POPULATION_FIXED_POINT_SCALE as f64).round();
-    if fixed_population >= i64::MAX as f64 {
-        return Err(anyhow!(
-            "population value {} exceeds the fixed-point range",
-            population
-        ));
-    }
-
-    Ok(fixed_population as i64)
-}
-
-/// Adds a non-negative fixed-point population to an S2 cell.
-fn add_population(
-    cell_populations: &mut FxHashMap<u64, i64>,
-    cell_id: u64,
-    population: i64,
-) -> Result<()> {
-    if population < 0 {
-        return Err(anyhow!(
-            "population increment must be non-negative: {}",
-            population
-        ));
-    }
-
-    let accumulated_population = cell_populations.entry(cell_id).or_insert(0);
-    *accumulated_population = accumulated_population
-        .checked_add(population)
-        .ok_or_else(|| {
-            anyhow!(
-                "fixed-point population overflow for S2 cell {:016x}: {} + {}",
-                cell_id,
-                accumulated_population,
-                population
-            )
-        })?;
-    Ok(())
-}
-
 /// Extracts the leaves of the pruned quadtree for all S2 faces, requiring every face to yield at
 /// least one leaf. Returns an error if any face's total population is below the threshold, since a
 /// whole face with no cells would leave that region with no coarsening cell on-device.
@@ -580,9 +132,7 @@ fn extract_pruned_leaves(cell_populations: &FxHashMap<u64, i64>) -> Result<Vec<u
         // silently empty a face and turn that suppression into a normal user-facing outcome.
         if leaves.len() == leaves_before {
             return Err(anyhow!(
-                "S2 face {} produced no leaves: its total population is below the threshold ({}). \
-                 A valid Earth-scale dataset populates every face — the input GeoTIFF or the \
-                 threshold is wrong.",
+                "S2 face {} produced no leaves because its population is below {}; verify the GeoTIFF and threshold",
                 face,
                 POPULATION_THRESHOLD
             ));
@@ -602,8 +152,7 @@ fn main() -> Result<()> {
 
     if !arguments.tiff_path.exists() {
         return Err(anyhow!(
-            "input TIFF file '{}' not found.\n\
-             Please refer to the Data source section in README.md for instructions on how to download the required GeoTIFF dataset.",
+            "input TIFF file '{}' not found; see the Data source section in README.md",
             arguments.tiff_path.display()
         ));
     }
@@ -757,7 +306,25 @@ fn main() -> Result<()> {
         ));
     }
 
-    write_s2pp_database(&arguments.database_path, &compact_leaves)?;
+    println!("Writing mmap-only S2 quadtree topology database...");
+    write_topology_database(&arguments.database_path, &compact_leaves)?;
+
+    let query_engine = open_database_snapshot(&arguments.database_path)?;
+    let reconstructed_leaves = query_engine.reconstruct_all_leaves()?;
+    if reconstructed_leaves != compact_leaves {
+        return Err(anyhow!(
+            "database leaf reconstruction differs from the GeoTIFF-derived leaves"
+        ));
+    }
+
+    println!(
+        "Successfully generated and verified database file: '{}'",
+        arguments.database_path.display()
+    );
+    println!(
+        "File size: {:.3} MB",
+        std::fs::metadata(&arguments.database_path)?.len() as f64 / (1024.0 * 1024.0)
+    );
     println!("\nTotal Build Time: {:.2?}.", start_time.elapsed());
     Ok(())
 }
@@ -765,6 +332,7 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use population_density::POPULATION_FIXED_POINT_SCALE;
 
     /// Verifies that population conversion preserves normal fixed-point values.
     #[test]
@@ -825,51 +393,6 @@ mod tests {
         assert_eq!(cell_populations[&CELL_ID], i64::MAX);
     }
 
-    /// Verifies that writing an empty set of compact leaves fails fast.
-    #[test]
-    fn test_write_s2pp_database_empty_leaves_fails_fast() {
-        let database_path = PathBuf::from("scratch/test_empty_leaves.db");
-        let result = write_s2pp_database(&database_path, &[]);
-        assert!(result.is_err());
-        let error_message = result.unwrap_err().to_string();
-        assert!(error_message.contains("no valid population data found to build a database"));
-    }
-
-    /// Verifies that duplicate compact leaf IDs are rejected with a clear error.
-    #[test]
-    fn test_write_s2pp_database_duplicate_leaves_rejected() {
-        let database_path = PathBuf::from("scratch/test_duplicate_leaves.db");
-        let duplicate_leaves = vec![100, 100];
-        let result = write_s2pp_database(&database_path, &duplicate_leaves);
-        assert!(result.is_err());
-        let error_message = result.unwrap_err().to_string();
-        assert!(error_message.contains("duplicate compact leaf ID found"));
-    }
-
-    /// Verifies that out-of-order compact leaf IDs are rejected with a clear error.
-    #[test]
-    fn test_write_s2pp_database_out_of_order_leaves_rejected() {
-        let database_path = PathBuf::from("scratch/test_out_of_order_leaves.db");
-        let out_of_order_leaves = vec![100, 99];
-        let result = write_s2pp_database(&database_path, &out_of_order_leaves);
-        assert!(result.is_err());
-        let error_message = result.unwrap_err().to_string();
-        assert!(error_message.contains("compact leaves are out of order or duplicate"));
-    }
-
-    /// Verifies that a valid sequence of compact leaf IDs builds a database successfully.
-    #[test]
-    fn test_write_s2pp_database_success() {
-        let database_path = PathBuf::from("scratch/test_valid_leaves.db");
-        std::fs::create_dir_all("scratch").unwrap();
-        let valid_leaves = vec![100, 105, 110];
-        let result = write_s2pp_database(&database_path, &valid_leaves);
-        assert!(result.is_ok());
-        if database_path.exists() {
-            let _ = std::fs::remove_file(&database_path);
-        }
-    }
-
     /// Verifies that leaf extraction requires every S2 face to be populated, failing loudly if any
     /// face is empty (which would leave a whole region with no coarsening cell on-device).
     #[test]
@@ -884,7 +407,7 @@ mod tests {
         }
         let leaves =
             extract_pruned_leaves(&populations).expect("all faces populated should succeed");
-        assert_eq!(leaves.len(), NUM_ROOT_FACES as usize);
+        assert_eq!(leaves.len(), NUM_ROOT_FACES);
 
         // Dropping one face's population must make extraction fail loudly.
         let dropped_face_id = (0u64 << S2_FACE_SHIFT) | (1u64 << LEVEL_0_SENTINEL_SHIFT);

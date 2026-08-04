@@ -1,7 +1,5 @@
 //! Provides utility functions for GeoTIFF file decompression and verification.
 
-#![allow(clippy::collapsible_if)]
-
 use anyhow::{Result, anyhow};
 use std::fs::File;
 use std::io::BufReader;
@@ -10,7 +8,7 @@ use tiff::decoder::{Decoder, Limits};
 
 /// Manages automatic cleanup of a temporary file when dropped from scope.
 pub struct CleanupGuard {
-    pub path: Option<PathBuf>,
+    path: Option<PathBuf>,
 }
 
 impl CleanupGuard {
@@ -18,15 +16,36 @@ impl CleanupGuard {
     pub fn new(path: PathBuf) -> Self {
         Self { path: Some(path) }
     }
+
+    /// Creates an inactive cleanup guard.
+    fn inactive() -> Self {
+        Self { path: None }
+    }
 }
 
 impl Drop for CleanupGuard {
     fn drop(&mut self) {
-        if let Some(ref path) = self.path {
-            if path.exists() {
-                let _ = std::fs::remove_file(path);
+        let Some(path) = &self.path else {
+            return;
+        };
+        if let Err(error) = remove_file_if_present(path) {
+            if std::thread::panicking() {
+                return;
             }
+            panic!(
+                "failed to remove temporary file '{}': {error}",
+                path.display()
+            );
         }
+    }
+}
+
+/// Removes a file if it exists.
+fn remove_file_if_present(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -60,9 +79,7 @@ pub fn prepare_geotiff<P: AsRef<Path>>(
         let check_command = std::process::Command::new("tiffcp").arg("-i").output();
         if check_command.is_err() {
             return Err(anyhow!(
-                "system utility 'tiffcp' is not installed or not found on your PATH.\n\
-                 This tool is required to convert LZW-compressed GeoTIFFs to Deflate compression on-the-fly.\n\
-                 Please install the standard 'libtiff-tools' package."
+                "tiffcp is required to convert LZW-compressed GeoTIFF files but was not found on PATH"
             ));
         }
 
@@ -87,6 +104,6 @@ pub fn prepare_geotiff<P: AsRef<Path>>(
         }
         Ok((temporary_path, guard))
     } else {
-        Ok((path_ref.to_path_buf(), CleanupGuard { path: None }))
+        Ok((path_ref.to_path_buf(), CleanupGuard::inactive()))
     }
 }

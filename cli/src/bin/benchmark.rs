@@ -2,7 +2,8 @@
 //!
 //! Measures Queries Per Second (QPS) performance with and without safe indexing.
 
-use population_density::{QueryEngine, SHIFT_COMPACT};
+use population_density::SHIFT_COMPACT;
+use population_density_cli::open_database_snapshot;
 use std::time::Instant;
 
 /// Configures the total number of benchmark queries to execute.
@@ -22,7 +23,7 @@ fn main() {
         return;
     }
 
-    let engine = QueryEngine::new(database_path).unwrap();
+    let engine = open_database_snapshot(database_path).unwrap();
     let leaves = engine.reconstruct_all_leaves().unwrap();
 
     if leaves.is_empty() {

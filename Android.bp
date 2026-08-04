@@ -4,9 +4,7 @@ rust_library {
     srcs: ["core/src/lib.rs"],
     rustlibs: [
         "libanyhow",
-        "libbytemuck",
         "libmemmap2",
     ],
     edition: "2024",
 }
-

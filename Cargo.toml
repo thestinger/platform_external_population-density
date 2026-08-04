@@ -11,10 +11,10 @@ edition = "2024"
 
 [workspace.dependencies]
 anyhow = "1.0.102"
-bytemuck = { version = "1.25.0", features = ["derive"] }
 clap = { version = "4.6.1", features = ["derive"] }
 memmap2 = "0.9.10"
 rayon = "1.12.0"
 rustc-hash = "2.1.2"
 s2 = "0.0.13"
+tempfile = "3.27.0"
 tiff = "0.11.3"

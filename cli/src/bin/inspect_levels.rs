@@ -1,19 +1,23 @@
 //! Analyzes and prints the distribution of S2 cell levels in the population density database.
 
-use anyhow::Result;
-use population_density::{QueryEngine, SHIFT_COMPACT, try_get_level};
+use anyhow::{Result, anyhow};
+use population_density::{SHIFT_COMPACT, try_get_level};
+use population_density_cli::open_database_snapshot;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+/// Prints the S2 level distribution reconstructed from the database.
 fn main() -> Result<()> {
     let database_path = Path::new("population_density_database.bin");
     if !database_path.exists() {
-        println!("Database file not found: {:?}", database_path);
-        return Ok(());
+        return Err(anyhow!(
+            "database file '{}' not found",
+            database_path.display()
+        ));
     }
 
     println!("Loading database and reconstructing all leaf cells...");
-    let query_engine = QueryEngine::new(database_path)?;
+    let query_engine = open_database_snapshot(database_path)?;
     let leaves = query_engine.reconstruct_all_leaves()?;
     let total_leaves = leaves.len();
     println!("Total reconstructed leaf cells: {}", total_leaves);

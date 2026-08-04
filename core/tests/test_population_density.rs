@@ -3,31 +3,29 @@
 //! Verifies correct S2 cell level calculations, ancestor mapping correctness,
 //! boundary/error handling, and query lookups for predefined geographic targets.
 
-#![allow(clippy::needless_range_loop, clippy::collapsible_if)]
+mod common;
 
+use anyhow::{Result, anyhow, ensure};
+use common::open_database;
 use population_density::{
-    BITS_PER_LEVEL, BLOCK_HEADER_SIZE, MAX_DB_LEVEL, MAX_S2_LEVEL, NUM_ROOT_FACES,
-    POPULATION_FIXED_POINT_SCALE, POPULATION_THRESHOLD_FIXED, QueryEngine, S2_FACE_BITS,
-    SHIFT_COMPACT, get_ancestor, get_children_ids, get_level, get_parent_id,
+    BITS_PER_LEVEL, MAX_DB_LEVEL, MAX_S2_LEVEL, NUM_ROOT_FACES, POPULATION_FIXED_POINT_SCALE,
+    POPULATION_THRESHOLD_FIXED, QueryEngine, S2_FACE_BITS, S2_FACE_SHIFT, SHIFT_COMPACT,
+    get_ancestor, get_children_ids, get_level, get_parent_id,
 };
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use s2::cellid::CellID;
 use s2::latlng::LatLng;
 use std::fs::File;
-use std::io::{BufReader, Write};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use tempfile::NamedTempFile;
 use tiff::decoder::{Decoder, DecodingResult, Limits};
 
-const TIFF_COMPRESSION_NONE: u16 = 1;
 const TIFF_COMPRESSION_LZW: u16 = 5;
 
-static TEMP_FILE_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-const S2_FACE_SHIFT: u32 = 61;
 const LEVEL_0_SENTINEL_SHIFT: u32 = 60;
 
 const GEOTIFF_MAX_LATITUDE: f64 = 84.0;
@@ -37,62 +35,62 @@ const PIXEL_CENTER_OFFSET: f64 = 0.5;
 const GEOTIFF_NODATA_VALUE: f32 = -99999.0;
 
 const SHARED_TIFF_PATH: &str = "../data/global_pop_2026_CN_1km_R2025A_UA_v1.tif";
+const GENERATED_DATABASE_PATH: &str = "../population_density_database.bin";
+const PACKAGED_DATABASE_PATH: &str =
+    "../../../packages/apps/NetworkLocation/res/raw/population_density_database.bin";
 
-/// The naive oracle is an expensive but deterministic, read-only product of the GeoTIFF: build it
-/// once and share it across the parity tests instead of re-decoding the multi-hundred-megabyte
-/// raster per test. This does not weaken coverage — every test still compares query() against this
-/// same immutable oracle, and nothing asserts properties of the build itself.
+/// Returns an available S2PD fixture path.
+fn database_path() -> PathBuf {
+    let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let generated_path = manifest_path.join(GENERATED_DATABASE_PATH);
+    if generated_path.exists() {
+        return generated_path;
+    }
+
+    let packaged_path = manifest_path.join(PACKAGED_DATABASE_PATH);
+    assert!(
+        packaged_path.exists(),
+        "S2PD database not found at '{}' or '{}'",
+        generated_path.display(),
+        packaged_path.display()
+    );
+    packaged_path
+}
+
+/// Stores the deterministic GeoTIFF-derived oracle shared by the parity tests.
 static SHARED_TIFF_ORACLE: LazyLock<NaiveOracle> = LazyLock::new(|| {
     assert!(
         Path::new(SHARED_TIFF_PATH).exists(),
-        "GeoTIFF file '{}' not found. Please ensure the raw data file is present at that path.",
+        "GeoTIFF source '{}' not found",
         SHARED_TIFF_PATH
     );
-    NaiveOracle::new_from_tiff(SHARED_TIFF_PATH).unwrap()
+    NaiveOracle::from_tiff(SHARED_TIFF_PATH).unwrap()
 });
 
-/// Manages automatic cleanup of a temporary file when dropped from scope.
-struct CleanupGuard {
-    path: Option<PathBuf>,
-}
-
-impl CleanupGuard {
-    /// Creates a new guard for a temporary file path.
-    fn new(path: PathBuf) -> Self {
-        Self { path: Some(path) }
-    }
-}
-
-impl Drop for CleanupGuard {
-    fn drop(&mut self) {
-        if let Some(ref path) = self.path {
-            if path.exists() {
-                if let Err(error) = std::fs::remove_file(path) {
-                    eprintln!(
-                        "Warning: Failed to remove temporary file '{}': {}",
-                        path.display(),
-                        error
-                    );
-                } else {
-                    println!(
-                        "Successfully cleaned up temporary file '{}'",
-                        path.display()
-                    );
-                }
-            }
-        }
-    }
-}
-
-/// Checks if a TIFF file is LZW compressed.
-fn is_lzw_compressed<P: AsRef<Path>>(path: P) -> anyhow::Result<bool> {
+/// Returns whether a TIFF file uses LZW compression.
+fn is_lzw_compressed<P: AsRef<Path>>(path: P) -> Result<bool> {
     let file = File::open(path)?;
     let mut decoder = Decoder::new(BufReader::new(file))?.with_limits(Limits::unlimited());
-    let compression = match decoder.get_tag_unsigned::<u16>(tiff::tags::Tag::Compression) {
-        Ok(compression_tag) => compression_tag,
-        Err(_) => TIFF_COMPRESSION_NONE, // Defaults to uncompressed if tag is missing.
-    };
+    let compression = decoder.get_tag_unsigned::<u16>(tiff::tags::Tag::Compression)?;
     Ok(compression == TIFF_COMPRESSION_LZW)
+}
+
+/// Converts a finite population value to fixed-point units.
+fn convert_population_to_fixed(population: f32) -> i64 {
+    let fixed_population = (f64::from(population) * POPULATION_FIXED_POINT_SCALE as f64).round();
+    assert!(
+        fixed_population < i64::MAX as f64,
+        "population value exceeds the fixed-point range"
+    );
+    fixed_population as i64
+}
+
+/// Adds population to a cell with checked fixed-point accumulation.
+fn add_population(cell_populations: &mut FxHashMap<u64, i64>, cell_id: u64, population: i64) {
+    let accumulated_population = cell_populations.entry(cell_id).or_insert(0);
+    *accumulated_population = accumulated_population
+        .checked_add(population)
+        .unwrap_or_else(|| panic!("fixed-point population overflow for S2 cell {cell_id:016x}"));
 }
 
 /// Recursively finds the leaves of the pruned S2 cell quadtree.
@@ -131,7 +129,7 @@ fn find_leaves_recursive(
     }
 }
 
-/// Generates a set of test points across representative locations.
+/// Returns several geographic test points.
 fn get_test_points() -> Vec<LatLng> {
     vec![
         LatLng::from_degrees(39.9042, 116.4074), // Beijing
@@ -165,38 +163,22 @@ fn test_bitwise_ancestors() {
     }
 }
 
-/// Verifies that loading a nonexistent database file fails gracefully.
+/// Verifies that opening a nonexistent database file fails gracefully.
 #[test]
 fn test_missing_database() {
-    let result = QueryEngine::new("nonexistent_db.db");
-    assert!(result.is_err());
-}
+    let temporary_directory = tempfile::tempdir().unwrap();
+    let missing_database = temporary_directory.path().join("missing.bin");
 
-/// Verifies that a database with invalid magic bytes fails to load.
-#[test]
-fn test_invalid_magic_bytes() {
-    let temporary_database = "scratch/temp_invalid.db";
-    std::fs::create_dir_all("scratch").unwrap();
-    {
-        let mut file = File::create(temporary_database).unwrap();
-        file.write_all(b"BAD_MAGIC").unwrap();
-    }
-    let result = QueryEngine::new(temporary_database);
+    // SAFETY: The path does not exist, so no file-backed mapping can be created.
+    let result = unsafe { QueryEngine::open(&missing_database) };
     assert!(result.is_err());
-    std::fs::remove_file(temporary_database).unwrap();
 }
 
 /// Runs geographic query lookups and asserts accuracy against expected levels.
 #[test]
 fn test_actual_queries() {
-    let database_path = "../population_density_database.bin";
-    assert!(
-        std::path::Path::new(database_path).exists(),
-        "Database file '{}' not found. Please build the database first using 'cargo run --release --bin build_database'.",
-        database_path
-    );
-
-    let query_engine = QueryEngine::new(database_path).unwrap();
+    let database_path = database_path();
+    let query_engine = open_database(&database_path).unwrap();
 
     // Query Beijing and verify it has a populated ancestor.
     let beijing_point = LatLng::from_degrees(39.9042, 116.4074);
@@ -204,7 +186,7 @@ fn test_actual_queries() {
     let beijing_result = query_engine.query(beijing_cell_id.0).unwrap();
     assert_ne!(
         beijing_result, 0,
-        "Beijing should have a populated ancestor!"
+        "Beijing should have a populated ancestor"
     );
     assert!(get_level(beijing_result) <= MAX_DB_LEVEL);
 
@@ -212,7 +194,7 @@ fn test_actual_queries() {
     let ocean_point = LatLng::from_degrees(0.0, -140.0);
     let ocean_cell_id = CellID::from(ocean_point);
     let ocean_result = query_engine.query(ocean_cell_id.0).unwrap();
-    assert_ne!(ocean_result, 0, "Ocean should have a coarse ancestor!");
+    assert_ne!(ocean_result, 0, "ocean should have a coarse ancestor");
     assert!(get_level(ocean_result) <= 3);
 
     // Query Mount Everest and verify its ancestor level.
@@ -221,7 +203,7 @@ fn test_actual_queries() {
     let everest_result = query_engine.query(everest_cell_id.0).unwrap();
     assert_ne!(
         everest_result, 0,
-        "Mount Everest should have a populated ancestor!"
+        "Mount Everest should have a populated ancestor"
     );
     assert_eq!(
         get_level(everest_result),
@@ -230,72 +212,39 @@ fn test_actual_queries() {
     );
 }
 
-/// Represents a naive baseline reference query oracle.
-///
-/// This implementation performs a standard binary search and direct bitwise
-/// ancestor matching on a fully reconstructed flat leaf cell ID array to serve
-/// as the 100% correct baseline for correctness verification.
-pub struct NaiveOracle {
+/// Implements reference queries over a flat leaf cell ID array.
+struct NaiveOracle {
     leaves: Vec<u32>,
-    /// Propagated population per S2 cell in fixed-point units, used by the population-invariant test.
+    /// Stores propagated fixed-point population per S2 cell.
     populations: FxHashMap<u64, i64>,
 }
 
 impl NaiveOracle {
-    /// Creates a new naive oracle by reconstructing all leaf cells from a QueryEngine.
-    pub fn new(query_engine: &QueryEngine) -> Self {
-        Self {
-            leaves: query_engine.reconstruct_all_leaves().unwrap(),
-            populations: FxHashMap::default(),
-        }
-    }
-
-    /// Creates a new naive oracle by parsing the raw GeoTIFF directly.
-    pub fn new_from_tiff<P: AsRef<Path>>(tiff_path: P) -> anyhow::Result<Self> {
+    /// Creates a naive oracle by parsing the raw GeoTIFF directly.
+    fn from_tiff<P: AsRef<Path>>(tiff_path: P) -> Result<Self> {
         let is_lzw = is_lzw_compressed(tiff_path.as_ref())?;
 
         let mut current_tiff_path = tiff_path.as_ref().to_path_buf();
-        let _guard;
+        let mut _temporary_directory = None;
 
         if is_lzw {
-            // Check if tiffcp is installed on the system.
-            let check_command = Command::new("tiffcp").arg("-i").output();
-            if check_command.is_err() {
-                return Err(anyhow::anyhow!(
-                    "System utility 'tiffcp' is not installed or not found on your PATH.\n\
-                     This tool is required to convert LZW-compressed GeoTIFFs to Deflate compression on-the-fly."
-                ));
-            }
-
-            let counter = TEMP_FILE_COUNTER.fetch_add(1, Ordering::SeqCst);
-            let temporary_path = tiff_path
-                .as_ref()
-                .with_extension(format!("tmp_{}.tif", counter));
-            _guard = CleanupGuard::new(temporary_path.clone());
-
-            let mut child = Command::new("tiffcp")
+            let temporary_directory = tempfile::tempdir()?;
+            let temporary_path = temporary_directory.path().join("prepared.tif");
+            let status = Command::new("tiffcp")
                 .arg("-m")
                 .arg("0")
                 .arg("-c")
                 .arg("zip")
                 .arg(tiff_path.as_ref())
                 .arg(&temporary_path)
-                .spawn()
-                .map_err(|error| anyhow::anyhow!("Failed to spawn tiffcp subprocess: {}", error))?;
-
-            let status = child.wait().map_err(|error| {
-                anyhow::anyhow!("Failed to wait on tiffcp subprocess: {}", error)
-            })?;
+                .status()
+                .map_err(|error| anyhow!("failed to run tiffcp: {error}"))?;
             if !status.success() {
-                return Err(anyhow::anyhow!(
-                    "tiffcp failed with exit code: {:?}",
-                    status.code().unwrap_or(-1)
-                ));
+                return Err(anyhow!("tiffcp failed with status {status}"));
             }
 
             current_tiff_path = temporary_path;
-        } else {
-            _guard = CleanupGuard { path: None };
+            _temporary_directory = Some(temporary_directory);
         }
 
         let file = File::open(&current_tiff_path)?;
@@ -303,51 +252,52 @@ impl NaiveOracle {
 
         let (width, height) = decoder.dimensions()?;
         let image_result = decoder.read_image()?;
+        let width_usize = usize::try_from(width)?;
+        let height_usize = usize::try_from(height)?;
+        let expected_pixel_count = width_usize
+            .checked_mul(height_usize)
+            .ok_or_else(|| anyhow!("GeoTIFF dimensions exceed the addressable range"))?;
 
         let data = match image_result {
-            DecodingResult::F32(vec) => {
-                if vec.len() != (width as usize) * (height as usize) {
-                    return Err(anyhow::anyhow!(
-                        "Decoded image data vector length {} does not match expected size {} x {} = {}",
-                        vec.len(),
-                        width,
-                        height,
-                        (width as usize) * (height as usize)
-                    ));
-                }
-                vec
+            DecodingResult::F32(data) => {
+                ensure!(
+                    data.len() == expected_pixel_count,
+                    "decoded image length {} does not match {width} x {height} = {expected_pixel_count}",
+                    data.len()
+                );
+                data
             }
-            _ => {
-                return Err(anyhow::anyhow!(
-                    "Unexpected image data type (expected Float32)"
-                ));
-            }
+            _ => return Err(anyhow!("unexpected image data type (expected Float32)")),
         };
 
-        let width_usize = width as usize;
-        let level_12_populations = (0..height as usize)
+        let level_12_populations = (0..height_usize)
             .into_par_iter()
             .fold(FxHashMap::default, |mut local_map, pixel_y| {
                 let row_offset = pixel_y * width_usize;
                 let pixel_y_float = pixel_y as f64;
                 for pixel_x in 0..width_usize {
                     let value = data[row_offset + pixel_x];
-                    if value.is_finite() && value > 0.0 && value != GEOTIFF_NODATA_VALUE {
-                        let latitude = GEOTIFF_MAX_LATITUDE
-                            - (pixel_y_float + PIXEL_CENTER_OFFSET) * GEOTIFF_PIXEL_SCALE;
-                        let longitude = GEOTIFF_MIN_LONGITUDE
-                            + ((pixel_x as f64) + PIXEL_CENTER_OFFSET) * GEOTIFF_PIXEL_SCALE;
-                        let latitude_longitude = LatLng::from_degrees(latitude, longitude);
-                        let cell_id = CellID::from(latitude_longitude).parent(MAX_DB_LEVEL as u64);
-                        *local_map.entry(cell_id.0).or_insert(0i64) +=
-                            (value as f64 * POPULATION_FIXED_POINT_SCALE as f64).round() as i64;
+                    if value == 0.0 || value == GEOTIFF_NODATA_VALUE {
+                        continue;
                     }
+                    assert!(
+                        value.is_finite() && value > 0.0,
+                        "source GeoTIFF pixel ({pixel_x}, {pixel_y}) contains invalid population {value}"
+                    );
+                    let latitude = GEOTIFF_MAX_LATITUDE
+                        - (pixel_y_float + PIXEL_CENTER_OFFSET) * GEOTIFF_PIXEL_SCALE;
+                    let longitude = GEOTIFF_MIN_LONGITUDE
+                        + ((pixel_x as f64) + PIXEL_CENTER_OFFSET) * GEOTIFF_PIXEL_SCALE;
+                    let latitude_longitude = LatLng::from_degrees(latitude, longitude);
+                    let cell_id = CellID::from(latitude_longitude).parent(MAX_DB_LEVEL as u64);
+                    let population = convert_population_to_fixed(value);
+                    add_population(&mut local_map, cell_id.0, population);
                 }
                 local_map
             })
             .reduce(FxHashMap::default, |mut accumulator_map, local_map| {
                 for (cell_id, population) in local_map {
-                    *accumulator_map.entry(cell_id).or_insert(0) += population;
+                    add_population(&mut accumulator_map, cell_id, population);
                 }
                 accumulator_map
             });
@@ -363,7 +313,7 @@ impl NaiveOracle {
             for &cell_id in &current_level_cells {
                 let parent_id = get_parent_id(cell_id, level);
                 let population = *cell_populations.get(&cell_id).unwrap_or(&0);
-                *cell_populations.entry(parent_id).or_insert(0) += population;
+                add_population(&mut cell_populations, parent_id, population);
                 parent_level_cells.push(parent_id);
             }
             parent_level_cells.sort_unstable();
@@ -394,7 +344,7 @@ impl NaiveOracle {
     }
 
     /// Performs the query using flat binary search and ancestor matching.
-    pub fn query(&self, s2_cell_id: u64) -> u64 {
+    fn query(&self, s2_cell_id: u64) -> u64 {
         debug_assert!(s2_cell_id != 0, "S2 cell ID cannot be 0");
         let query_level = get_level(s2_cell_id);
         let query_cell_id = if query_level > MAX_DB_LEVEL {
@@ -402,9 +352,8 @@ impl NaiveOracle {
         } else {
             s2_cell_id
         };
-        let compact_query_id = ((query_cell_id >> SHIFT_COMPACT) & 0xFFFFFFFF) as u32;
+        let compact_query_id = (query_cell_id >> SHIFT_COMPACT) as u32;
 
-        // Perform standard binary search on the flat sorted leaves array.
         let search_result = self.leaves.binary_search(&compact_query_id);
 
         let (left_index_option, right_index_option) = match search_result {
@@ -468,38 +417,28 @@ impl NaiveOracle {
     }
 }
 
-/// Verifies 100% query parity for all 100,663,296 Level 12 cell IDs globally.
+/// Verifies exhaustive parity for all level-12 query cells.
 ///
-/// This test runs in parallel across all 6 S2 faces using Rayon, verifying that
+/// This test runs in parallel across all six S2 faces, verifying that
 /// the optimized QueryEngine query matches the NaiveOracle query perfectly.
 #[test]
 fn test_exhaustive_global_l12_parity() {
-    const S2_FACE_SHIFT: u32 = 61;
-    const STEP_SHIFT: u32 = 37;
+    const LEVEL_12_CELL_STEP_SHIFT: u32 = 37;
 
-    let database_path = "../population_density_database.bin";
-    assert!(
-        std::path::Path::new(database_path).exists(),
-        "Database file '{}' not found. Please build the database first using 'cargo run --release --bin build_database'.",
-        database_path
-    );
-
-    let query_engine = QueryEngine::new(database_path).unwrap();
+    let database_path = database_path();
+    let query_engine = open_database(&database_path).unwrap();
     let naive_oracle = &*SHARED_TIFF_ORACLE;
 
-    println!(
-        "Starting exhaustive global Level 12 parity test over 100,663,296 cells in parallel..."
-    );
+    println!("checking exhaustive level-12 parity in parallel");
     let start_time = std::time::Instant::now();
 
-    let faces: Vec<usize> = (0..6).collect();
-    let mismatches: usize = faces
+    let mismatches: usize = (0..NUM_ROOT_FACES)
         .into_par_iter()
         .map(|face| {
             let mut face_mismatches = 0;
             let start_cell = (face as u64) << S2_FACE_SHIFT | (1u64 << SHIFT_COMPACT);
             let end_cell = ((face + 1) as u64) << S2_FACE_SHIFT;
-            let step = 1u64 << STEP_SHIFT;
+            let step = 1u64 << LEVEL_12_CELL_STEP_SHIFT;
 
             let mut s2_cell_id = start_cell;
             while s2_cell_id < end_cell {
@@ -510,7 +449,7 @@ fn test_exhaustive_global_l12_parity() {
                     face_mismatches += 1;
                     if face_mismatches <= 5 {
                         println!(
-                            "    [Mismatch] Face {}: Cell {:016x}: Optimized={:016x}, Naive={:016x}",
+                            "mismatch on face {} at cell {:016x}: optimized={:016x}, naive={:016x}",
                             face, s2_cell_id, optimized_result, naive_result
                         );
                     }
@@ -522,52 +461,24 @@ fn test_exhaustive_global_l12_parity() {
         .sum();
 
     let elapsed = start_time.elapsed();
-    println!("Exhaustive parity test completed in {:.2?}.", elapsed);
+    println!("exhaustive parity completed in {elapsed:.2?}");
     assert_eq!(
         mismatches, 0,
-        "Exhaustive parity test failed with {} mismatches!",
+        "exhaustive parity failed with {} mismatches",
         mismatches
     );
-    println!("SUCCESS: Verified all 100,663,296 Level 12 cells with exactly 0 mismatches.");
 }
 
-/// Verifies that a database with an invalid/oversized block_size fails to load.
-#[test]
-fn test_invalid_block_size() {
-    let temporary_database = "scratch/temp_invalid_block_size.db";
-    std::fs::create_dir_all("scratch").unwrap();
-    {
-        let mut file = File::create(temporary_database).unwrap();
-        // S2PP magic bytes
-        file.write_all(b"S2PP").unwrap();
-        // count = 0 (4 bytes)
-        file.write_all(&0u32.to_le_bytes()).unwrap();
-        // block_size = 257 (4 bytes), which is > MAX_DELTAS_CAPACITY + 1
-        file.write_all(&257u32.to_le_bytes()).unwrap();
-        // block_count = 0 (4 bytes)
-        file.write_all(&0u32.to_le_bytes()).unwrap();
-    }
-    let result = QueryEngine::new(temporary_database);
-    assert!(result.is_err());
-    let error_message = result.err().unwrap().to_string();
-    assert!(
-        error_message.contains("invalid block size in database: 257"),
-        "Unexpected error message: {}",
-        error_message
-    );
-    std::fs::remove_file(temporary_database).unwrap();
-}
-
-/// Verifies that standard `assert!` statements inside public helpers panic under invalid levels or cell IDs.
+/// Verifies that public helper preconditions panic on invalid inputs.
 #[test]
 fn test_assert_preconditions_panic() {
-    // Assert 0 cell ID panics in get_level.
+    // Require a nonzero cell ID.
     let result = std::panic::catch_unwind(|| {
         get_level(0);
     });
     assert!(result.is_err());
 
-    // Assert level > 30 panics in get_ancestor.
+    // Require a supported ancestor level.
     let result = std::panic::catch_unwind(|| {
         get_ancestor(1, 31);
     });
@@ -581,246 +492,11 @@ fn test_assert_preconditions_panic() {
     assert!(result.is_err());
 }
 
-/// Verifies that a database block with bit_width > 28 is detected as corrupt during query and reconstruction.
-#[test]
-fn test_corrupt_database_bit_width_limit() {
-    let temporary_database = "scratch/temp_corrupt_bit_width.db";
-    std::fs::create_dir_all("scratch").unwrap();
-    {
-        let mut file = File::create(temporary_database).unwrap();
-        // S2PP magic bytes
-        file.write_all(b"S2PP").unwrap();
-        // count = 2 (4 bytes)
-        file.write_all(&2u32.to_le_bytes()).unwrap();
-        // block_size = 256 (4 bytes)
-        file.write_all(&256u32.to_le_bytes()).unwrap();
-        // block_count = 1 (4 bytes)
-        file.write_all(&1u32.to_le_bytes()).unwrap();
-        // headers = [0u32] (4 bytes)
-        file.write_all(&0u32.to_le_bytes()).unwrap();
-        // absolute_offsets = [0u32] (4 bytes)
-        file.write_all(&0u32.to_le_bytes()).unwrap();
-        // relative_offsets = [0u16] (2 bytes)
-        file.write_all(&0u16.to_le_bytes()).unwrap();
-        // block bytes: bit_width of subblock 0 is 29, exception_count = 0.
-        // 12-byte header with bit_widths[0] = 29.
-        let mut header = [0u8; BLOCK_HEADER_SIZE];
-        header[0] = 29;
-        file.write_all(&header).unwrap();
-    }
-
-    let engine = QueryEngine::new(temporary_database).unwrap();
-
-    // Querying should fail.
-    let query_result = engine.query(1);
-    assert!(query_result.is_err());
-    assert!(
-        query_result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("bit_width 29 exceeds maximum limit 28")
-    );
-
-    // Reconstruction should fail.
-    let reconstruct_result = engine.reconstruct_all_leaves();
-    assert!(reconstruct_result.is_err());
-    assert!(
-        reconstruct_result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("bit_width 29 exceeds maximum limit 28")
-    );
-
-    std::fs::remove_file(temporary_database).unwrap();
-}
-
-/// Verifies that a database block with corrupt/out-of-bounds exception indexing is caught during query and reconstruction.
-#[test]
-fn test_corrupt_database_exception_bounds() {
-    let temporary_database = "scratch/temp_corrupt_exception.db";
-    std::fs::create_dir_all("scratch").unwrap();
-    {
-        let mut file = File::create(temporary_database).unwrap();
-        // S2PP magic bytes
-        file.write_all(b"S2PP").unwrap();
-        // count = 2 (4 bytes)
-        file.write_all(&2u32.to_le_bytes()).unwrap();
-        // block_size = 256 (4 bytes)
-        file.write_all(&256u32.to_le_bytes()).unwrap();
-        // block_count = 1 (4 bytes)
-        file.write_all(&1u32.to_le_bytes()).unwrap();
-        // headers = [0u32] (4 bytes)
-        file.write_all(&0u32.to_le_bytes()).unwrap();
-        // absolute_offsets = [0u32] (4 bytes)
-        file.write_all(&0u32.to_le_bytes()).unwrap();
-        // relative_offsets = [0u16] (2 bytes)
-        file.write_all(&0u16.to_le_bytes()).unwrap();
-        // block bytes: bit_width = 8, exception_count = 1, mode = U8 (1).
-        // 12-byte header: bit_widths[0] = 8, exception_count = 1, flags = 1 (EXCEPTION_MODE_U8).
-        let mut header = [0u8; BLOCK_HEADER_SIZE];
-        header[0] = 8;
-        header[BLOCK_HEADER_SIZE - 2] = 1;
-        header[BLOCK_HEADER_SIZE - 1] = 1;
-        file.write_all(&header).unwrap();
-        // Also write 1 dummy byte representing the packed delta.
-        // We omit the actual exception index and exception value bytes so the bounds check fails.
-        file.write_all(&[0]).unwrap();
-    }
-
-    let engine = QueryEngine::new(temporary_database).unwrap();
-
-    // Querying should fail.
-    let query_result = engine.query(1);
-    assert!(query_result.is_err());
-    assert!(
-        query_result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("truncated exception indices")
-    );
-
-    // Reconstruction should fail.
-    let reconstruct_result = engine.reconstruct_all_leaves();
-    assert!(reconstruct_result.is_err());
-    assert!(
-        reconstruct_result
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("truncated exception indices")
-    );
-
-    std::fs::remove_file(temporary_database).unwrap();
-}
-
-/// Verifies that a database block with a corrupt/out-of-range exception index is caught during query and reconstruction.
-#[test]
-fn test_corrupt_database_exception_index_out_of_range() {
-    let temporary_database = "scratch/temp_corrupt_exception_out_of_range.db";
-    std::fs::create_dir_all("scratch").unwrap();
-    {
-        let mut file = File::create(temporary_database).unwrap();
-        // S2PP magic bytes
-        file.write_all(b"S2PP").unwrap();
-        // count = 2 (4 bytes)
-        file.write_all(&2u32.to_le_bytes()).unwrap();
-        // block_size = 256 (4 bytes)
-        file.write_all(&256u32.to_le_bytes()).unwrap();
-        // block_count = 1 (4 bytes)
-        file.write_all(&1u32.to_le_bytes()).unwrap();
-        // headers = [0u32] (4 bytes)
-        file.write_all(&0u32.to_le_bytes()).unwrap();
-        // absolute_offsets = [0u32] (4 bytes)
-        file.write_all(&0u32.to_le_bytes()).unwrap();
-        // relative_offsets = [0u16] (2 bytes)
-        file.write_all(&0u16.to_le_bytes()).unwrap();
-        // block bytes.
-        // Header (12 bytes): bit_widths[0] = 8, exception_count = 1, flags = 1 (EXCEPTION_MODE_U8).
-        let mut header = [0u8; BLOCK_HEADER_SIZE];
-        header[0] = 8;
-        header[BLOCK_HEADER_SIZE - 2] = 1;
-        header[BLOCK_HEADER_SIZE - 1] = 1;
-        file.write_all(&header).unwrap();
-        // 0: 1 byte of packed deltas.
-        // 1: 1 byte of exception index (since delta_count = 1, index 1 is out of range 0..1).
-        // 100: 1 byte exception value.
-        file.write_all(&[0, 1, 100]).unwrap();
-    }
-
-    let engine = QueryEngine::new(temporary_database).unwrap();
-
-    // Querying should fail.
-    let query_result = engine.query(1);
-    assert!(query_result.is_err());
-    let error_message = query_result.err().unwrap().to_string();
-    assert!(
-        error_message.contains("corrupt database block exception index 1 out of range"),
-        "Unexpected error message: {}",
-        error_message
-    );
-
-    // Reconstruction should fail.
-    let reconstruct_result = engine.reconstruct_all_leaves();
-    assert!(reconstruct_result.is_err());
-    let error_message = reconstruct_result.err().unwrap().to_string();
-    assert!(
-        error_message.contains("corrupt database block exception index 1 out of range"),
-        "Unexpected error message: {}",
-        error_message
-    );
-
-    std::fs::remove_file(temporary_database).unwrap();
-}
-
-/// Verifies that loading a database with a block size of zero returns a validation error.
-#[test]
-fn test_zero_block_size() {
-    let temporary_database = "scratch/temp_zero_block_size.db";
-    std::fs::create_dir_all("scratch").unwrap();
-    {
-        let mut file = File::create(temporary_database).unwrap();
-        // S2PP magic bytes
-        file.write_all(b"S2PP").unwrap();
-        // count = 0 (4 bytes)
-        file.write_all(&0u32.to_le_bytes()).unwrap();
-        // block_size = 0 (4 bytes)
-        file.write_all(&0u32.to_le_bytes()).unwrap();
-        // block_count = 0 (4 bytes)
-        file.write_all(&0u32.to_le_bytes()).unwrap();
-    }
-
-    let query_engine_result = QueryEngine::new(temporary_database);
-    assert!(query_engine_result.is_err());
-    let error_message = query_engine_result.err().unwrap().to_string();
-    assert!(
-        error_message.contains("invalid database: block_size must be greater than 0"),
-        "Unexpected error message: {}",
-        error_message
-    );
-    std::fs::remove_file(temporary_database).unwrap();
-}
-
-/// Verifies that loading a database with zero blocks returns a validation error.
-#[test]
-fn test_zero_block_count() {
-    let temporary_database = "scratch/temp_zero_block_count.db";
-    std::fs::create_dir_all("scratch").unwrap();
-    {
-        let mut file = File::create(temporary_database).unwrap();
-        // S2PP magic bytes
-        file.write_all(b"S2PP").unwrap();
-        // count = 0 (4 bytes)
-        file.write_all(&0u32.to_le_bytes()).unwrap();
-        // block_size = 256 (4 bytes)
-        file.write_all(&256u32.to_le_bytes()).unwrap();
-        // block_count = 0 (4 bytes)
-        file.write_all(&0u32.to_le_bytes()).unwrap();
-    }
-
-    let query_engine_result = QueryEngine::new(temporary_database);
-    assert!(query_engine_result.is_err());
-    let error_message = query_engine_result.err().unwrap().to_string();
-    assert!(
-        error_message.contains("invalid database: block_count must be greater than 0"),
-        "Unexpected error message: {}",
-        error_message
-    );
-    std::fs::remove_file(temporary_database).unwrap();
-}
-
 /// Verifies query parity for finer-level S2 cell ID queries where bit 36 is 0.
 #[test]
 fn test_query_finer_levels_regression() {
-    let database_path = "../population_density_database.bin";
-    assert!(
-        std::path::Path::new(database_path).exists(),
-        "Database file '{}' not found. Please build the database first using 'cargo run --release --bin build_database'.",
-        database_path
-    );
-    let query_engine = QueryEngine::new(database_path).unwrap();
+    let database_path = database_path();
+    let query_engine = open_database(&database_path).unwrap();
     let naive_oracle = &*SHARED_TIFF_ORACLE;
 
     // Choose a specific Level 17 cell ID where bit 36 is 0.
@@ -840,110 +516,33 @@ fn test_adversarial_get_level_underflow() {
     });
     assert!(
         result.is_err(),
-        "Vulnerability 1: get_level must panic on invalid cell ID"
+        "get_level must panic on an invalid cell ID"
     );
 }
 
-/// Verifies that loading a database with mathematically inconsistent headers returns an error.
-#[test]
-fn test_adversarial_inconsistent_header_underflow() {
-    let temporary_database = "scratch/temp_inconsistent_header.db";
-    std::fs::create_dir_all("scratch").unwrap();
-    {
-        let mut file = std::fs::File::create(temporary_database).unwrap();
-        file.write_all(b"S2PP").unwrap();
-        // Write count of 1.
-        file.write_all(&1u32.to_le_bytes()).unwrap();
-        // Write block_size of 256.
-        file.write_all(&256u32.to_le_bytes()).unwrap();
-        // Write block_count of 2.
-        file.write_all(&2u32.to_le_bytes()).unwrap();
-        // Write headers.
-        file.write_all(&[0u32.to_le_bytes(), 0u32.to_le_bytes()].concat())
-            .unwrap();
-        // Write absolute offsets.
-        file.write_all(&[0u32.to_le_bytes()].concat()).unwrap();
-        // Write relative offsets.
-        file.write_all(&[0u16.to_le_bytes(), 0u16.to_le_bytes()].concat())
-            .unwrap();
-        // Write block data.
-        file.write_all(&[0u8, 0u8]).unwrap();
-    }
-
-    let result = QueryEngine::new(temporary_database);
-    assert!(
-        result.is_err(),
-        "Vulnerability 2: QueryEngine::new must reject mathematically inconsistent headers"
-    );
-    let _ = std::fs::remove_file(temporary_database);
-}
-
-/// Verifies that querying with a cell ID of 0 returns a graceful error instead of panicking.
+/// Verifies that querying with a cell ID of 0 returns an error instead of panicking.
 #[test]
 fn test_query_zero_cell_id() {
-    let database_path = "../population_density_database.bin";
-    assert!(
-        std::path::Path::new(database_path).exists(),
-        "Database file '{}' not found. Please build the database first using 'cargo run --release --bin build_database'.",
-        database_path
-    );
-
-    let query_engine = QueryEngine::new(database_path).unwrap();
+    let database_path = database_path();
+    let query_engine = open_database(&database_path).unwrap();
     let result = query_engine.query(0);
     assert!(result.is_err());
     let error_message = result.err().unwrap().to_string();
     assert!(error_message.contains("S2 cell ID cannot be 0"));
 }
 
-/// Verifies that compact S2 cell ID boundary checks fail if database contains out-of-bounds compact IDs.
-#[test]
-fn test_corrupt_database_max_compact_limit() {
-    let temporary_database = "scratch/temp_max_compact_limit.db";
-    std::fs::create_dir_all("scratch").unwrap();
-    {
-        let mut file = std::fs::File::create(temporary_database).unwrap();
-        // Write standard S2PP magic bytes.
-        file.write_all(b"S2PP").unwrap();
-        // Write count of 2.
-        file.write_all(&2u32.to_le_bytes()).unwrap();
-        // Write block_size of 256.
-        file.write_all(&256u32.to_le_bytes()).unwrap();
-        // Write block_count of 1.
-        file.write_all(&1u32.to_le_bytes()).unwrap();
-        // Write an out-of-bounds header ID of 0x10000000.
-        file.write_all(&0x10000000u32.to_le_bytes()).unwrap();
-        // Write absolute offset of 0.
-        file.write_all(&0u32.to_le_bytes()).unwrap();
-        // Write relative offset of 0.
-        file.write_all(&0u16.to_le_bytes()).unwrap();
-        // Write block bytes: bit_width = 8, exception_count = 0.
-        file.write_all(&[8, 0]).unwrap();
-    }
-
-    let result = QueryEngine::new(temporary_database);
-    assert!(result.is_err());
-    let error_message = result.err().unwrap().to_string();
-    assert!(
-        error_message.contains("header cell ID 10000000 exceeds maximum compact S2 cell ID limit")
-    );
-    let _ = std::fs::remove_file(temporary_database);
-}
-
-/// Verifies resolved S2 levels across high-fidelity geographic transition scenarios.
+/// Verifies resolved S2 levels across geographic transition scenarios.
 #[test]
 fn test_geographic_transition_scenarios() {
-    let database_path = "../population_density_database.bin";
-    assert!(
-        std::path::Path::new(database_path).exists(),
-        "Database file '{}' not found. Please build the database first using 'cargo run --release --bin build_database'.",
-        database_path
-    );
-
-    let query_engine = QueryEngine::new(database_path).unwrap();
+    let database_path = database_path();
+    let query_engine = open_database(&database_path).unwrap();
     let naive_oracle = &*SHARED_TIFF_ORACLE;
 
-    let verify_query = |lat: f64, lng: f64, desc: &str, expected_level_check: fn(u32) -> bool| {
-        let point = LatLng::from_degrees(lat, lng);
+    let verify_query = |latitude: f64,
+                        longitude: f64,
+                        description: &str,
+                        level_matches: fn(u32) -> bool| {
+        let point = LatLng::from_degrees(latitude, longitude);
         let query_cell_id = CellID::from(point).0;
 
         let optimized_result = query_engine.query(query_cell_id).unwrap();
@@ -951,252 +550,68 @@ fn test_geographic_transition_scenarios() {
 
         assert_eq!(
             optimized_result, naive_result,
-            "Query mismatch at {} ({}, {}): optimized = {:016x}, naive = {:016x}",
-            desc, lat, lng, optimized_result, naive_result
+            "query mismatch at {} ({}, {}): optimized = {:016x}, naive = {:016x}",
+            description, latitude, longitude, optimized_result, naive_result
         );
 
         let level = get_level(optimized_result);
         assert!(
-            expected_level_check(level),
-            "Level expectation failed at {} ({}, {}): resolved to level {}, which did not satisfy the constraint",
-            desc,
-            lat,
-            lng,
+            level_matches(level),
+            "level expectation failed at {} ({}, {}): resolved to level {}, which did not satisfy the constraint",
+            description,
+            latitude,
+            longitude,
             level
         );
     };
 
-    // 1. Beijing Radius Scenario
-    verify_query(39.9042, 116.4074, "Beijing Center", |lvl| lvl == 12);
-    verify_query(39.9132, 116.4074, "Beijing 1km N", |lvl| lvl == 12);
-    verify_query(39.9042, 116.4191, "Beijing 1km E", |lvl| lvl == 12);
-    verify_query(39.8592, 116.4074, "Beijing 5km S", |lvl| lvl == 12);
-    verify_query(39.9042, 116.2904, "Beijing 10km W", |lvl| lvl == 12);
+    // 1. Beijing radius.
+    verify_query(39.9042, 116.4074, "Beijing Center", |level| level == 12);
+    verify_query(39.9132, 116.4074, "Beijing 1km N", |level| level == 12);
+    verify_query(39.9042, 116.4191, "Beijing 1km E", |level| level == 12);
+    verify_query(39.8592, 116.4074, "Beijing 5km S", |level| level == 12);
+    verify_query(39.9042, 116.2904, "Beijing 10km W", |level| level == 12);
     verify_query(
         40.3542,
         116.4074,
         "Huairou Mountains (Beijing 50km N)",
-        |lvl| lvl <= 10,
+        |level| level <= 10,
     );
 
-    // 2. Everest Peaks-vs-Valleys Scenario
-    verify_query(27.7172, 85.3240, "Kathmandu Valley", |lvl| lvl == 12);
-    verify_query(29.6524, 91.1172, "Lhasa", |lvl| lvl == 12);
-    verify_query(27.9881, 86.9250, "Mount Everest Peak", |lvl| lvl == 10);
+    // 2. Everest peaks and valleys.
+    verify_query(27.7172, 85.3240, "Kathmandu Valley", |level| level == 12);
+    verify_query(29.6524, 91.1172, "Lhasa", |level| level == 12);
+    verify_query(27.9881, 86.9250, "Mount Everest Peak", |level| level == 10);
 
-    // 3. Shanghai Coastline Scenario
-    verify_query(31.19, 121.40, "Shanghai Inland", |lvl| lvl == 12);
-    verify_query(31.19, 121.70, "Pudong Coastal Land", |lvl| lvl == 12);
-    verify_query(31.19, 121.80, "Shanghai Coastline Water Edge", |lvl| {
-        lvl == 11
+    // 3. Shanghai coastline.
+    verify_query(31.19, 121.40, "Shanghai Inland", |level| level == 12);
+    verify_query(31.19, 121.70, "Pudong Coastal Land", |level| level == 12);
+    verify_query(31.19, 121.80, "Shanghai Coastline Water Edge", |level| {
+        level == 11
     });
-    verify_query(31.19, 122.20, "Near-Shore Ocean", |lvl| {
-        lvl == 7 || lvl == 6
+    verify_query(31.19, 122.20, "Near-Shore Ocean", |level| {
+        level == 7 || level == 6
     });
-    verify_query(31.19, 123.50, "Open Sea", |lvl| {
-        lvl == 5 || lvl == 3 || lvl == 0
+    verify_query(31.19, 123.50, "Open Sea", |level| {
+        level == 5 || level == 3 || level == 0
     });
 
-    // 4. Unpopulated Islands Scenario
-    verify_query(-24.3797, -128.3242, "Henderson Island", |lvl| {
-        lvl == 3 || lvl == 0
+    // 4. Unpopulated islands.
+    verify_query(-24.3797, -128.3242, "Henderson Island", |level| {
+        level == 3 || level == 0
     });
-    verify_query(10.2983, -109.2192, "Clipperton Island", |lvl| {
-        lvl == 3 || lvl == 0
+    verify_query(10.2983, -109.2192, "Clipperton Island", |level| {
+        level == 3 || level == 0
     });
-    verify_query(-49.3500, 69.3500, "Kerguelen Islands", |lvl| {
-        lvl == 3 || lvl == 0
+    verify_query(-49.3500, 69.3500, "Kerguelen Islands", |level| {
+        level == 3 || level == 0
     });
-    verify_query(-54.4208, 3.3464, "Bouvet Island", |lvl| {
-        lvl == 3 || lvl == 0
+    verify_query(-54.4208, 3.3464, "Bouvet Island", |level| {
+        level == 3 || level == 0
     });
 }
 
-/// Verifies that loading a database with a non-zero first block offset fails.
-#[test]
-fn test_corrupt_database_non_zero_first_offset() {
-    let temporary_database = "scratch/temp_non_zero_first_offset.db";
-    std::fs::create_dir_all("scratch").unwrap();
-    {
-        let mut file = std::fs::File::create(temporary_database).unwrap();
-        file.write_all(b"S2PP").unwrap();
-        // Write count of 2.
-        file.write_all(&2u32.to_le_bytes()).unwrap();
-        // Write block_size of 256.
-        file.write_all(&256u32.to_le_bytes()).unwrap();
-        // Write block_count of 1.
-        file.write_all(&1u32.to_le_bytes()).unwrap();
-        // Write header S2 cell ID.
-        file.write_all(&0u32.to_le_bytes()).unwrap();
-        // Write non-zero first absolute offset.
-        file.write_all(&1u32.to_le_bytes()).unwrap();
-        // Write relative offset.
-        file.write_all(&0u16.to_le_bytes()).unwrap();
-        // Write block bytes: bit_width = 8, exception_count = 0.
-        file.write_all(&[8, 0]).unwrap();
-    }
-
-    let result = QueryEngine::new(temporary_database);
-    assert!(result.is_err());
-    let error_message = result.err().unwrap().to_string();
-    assert!(
-        error_message.contains("first block offset must be 0"),
-        "Unexpected error: {}",
-        error_message
-    );
-    let _ = std::fs::remove_file(temporary_database);
-}
-
-/// Verifies that loading a database with non-monotonic block offsets fails.
-#[test]
-fn test_corrupt_database_offsets_not_monotonic() {
-    let temporary_database = "scratch/temp_offsets_not_monotonic.db";
-    std::fs::create_dir_all("scratch").unwrap();
-    {
-        let mut file = std::fs::File::create(temporary_database).unwrap();
-        file.write_all(b"S2PP").unwrap();
-        // Write count of 257.
-        file.write_all(&257u32.to_le_bytes()).unwrap();
-        // Write block_size of 256.
-        file.write_all(&256u32.to_le_bytes()).unwrap();
-        // Write block_count of 2.
-        file.write_all(&2u32.to_le_bytes()).unwrap();
-        // Write header cell IDs.
-        file.write_all(&0u32.to_le_bytes()).unwrap();
-        file.write_all(&1u32.to_le_bytes()).unwrap();
-        // Write absolute offsets.
-        file.write_all(&0u32.to_le_bytes()).unwrap();
-        // Write non-monotonic relative offsets.
-        file.write_all(&0u16.to_le_bytes()).unwrap();
-        file.write_all(&0u16.to_le_bytes()).unwrap();
-        // Write block bytes.
-        file.write_all(&[8, 0, 0, 0]).unwrap();
-    }
-
-    let result = QueryEngine::new(temporary_database);
-    assert!(result.is_err());
-    let error_message = result.err().unwrap().to_string();
-    assert!(
-        error_message.contains("block offsets must be strictly monotonic"),
-        "Unexpected error: {}",
-        error_message
-    );
-    let _ = std::fs::remove_file(temporary_database);
-}
-
-/// Verifies that loading a database with out-of-bounds block offsets fails.
-#[test]
-fn test_corrupt_database_offset_out_of_bounds() {
-    let temporary_database = "scratch/temp_offset_out_of_bounds.db";
-    std::fs::create_dir_all("scratch").unwrap();
-    {
-        let mut file = std::fs::File::create(temporary_database).unwrap();
-        file.write_all(b"S2PP").unwrap();
-        // Write count of 257.
-        file.write_all(&257u32.to_le_bytes()).unwrap();
-        // Write block_size of 256.
-        file.write_all(&256u32.to_le_bytes()).unwrap();
-        // Write block_count of 2.
-        file.write_all(&2u32.to_le_bytes()).unwrap();
-        // Write header cell IDs.
-        file.write_all(&0u32.to_le_bytes()).unwrap();
-        file.write_all(&1u32.to_le_bytes()).unwrap();
-        // Write absolute offsets.
-        file.write_all(&0u32.to_le_bytes()).unwrap();
-        // Write out-of-bounds relative offset.
-        file.write_all(&0u16.to_le_bytes()).unwrap();
-        file.write_all(&9999u16.to_le_bytes()).unwrap();
-        // Write block bytes.
-        file.write_all(&[8, 0]).unwrap();
-    }
-
-    let result = QueryEngine::new(temporary_database);
-    assert!(result.is_err());
-    let error_message = result.err().unwrap().to_string();
-    assert!(
-        error_message.contains("exceeds physical file bounds"),
-        "Unexpected error: {}",
-        error_message
-    );
-    let _ = std::fs::remove_file(temporary_database);
-}
-
-/// Verifies that terminal block boundary checks detect a size mismatch when the last block has exactly 1 cell.
-#[test]
-fn test_corrupt_database_terminal_single_mismatch() {
-    let temporary_database = "scratch/temp_terminal_single_mismatch.db";
-    std::fs::create_dir_all("scratch").unwrap();
-    {
-        let mut file = std::fs::File::create(temporary_database).unwrap();
-        file.write_all(b"S2PP").unwrap();
-        // Write count of 257.
-        file.write_all(&257u32.to_le_bytes()).unwrap();
-        // Write block_size of 256.
-        file.write_all(&256u32.to_le_bytes()).unwrap();
-        // Write block_count of 2.
-        file.write_all(&2u32.to_le_bytes()).unwrap();
-        // Write header cell IDs.
-        file.write_all(&0u32.to_le_bytes()).unwrap();
-        file.write_all(&1u32.to_le_bytes()).unwrap();
-        // Write absolute offsets.
-        file.write_all(&0u32.to_le_bytes()).unwrap();
-        // Write relative offsets.
-        file.write_all(&0u16.to_le_bytes()).unwrap();
-        file.write_all(&1u16.to_le_bytes()).unwrap();
-        // Write block bytes.
-        file.write_all(&[8, 0]).unwrap();
-    }
-
-    let result = QueryEngine::new(temporary_database);
-    assert!(result.is_err());
-    let error_message = result.err().unwrap().to_string();
-    assert!(
-        error_message.contains("terminal block size mismatch"),
-        "Unexpected error: {}",
-        error_message
-    );
-    let _ = std::fs::remove_file(temporary_database);
-}
-
-/// Verifies that terminal block boundary checks detect a size mismatch when the last block has more than 1 cell.
-#[test]
-fn test_corrupt_database_terminal_multi_mismatch() {
-    let temporary_database = "scratch/temp_terminal_multi_mismatch.db";
-    std::fs::create_dir_all("scratch").unwrap();
-    {
-        let mut file = std::fs::File::create(temporary_database).unwrap();
-        file.write_all(b"S2PP").unwrap();
-        // Write count of 258.
-        file.write_all(&258u32.to_le_bytes()).unwrap();
-        // Write block_size of 256.
-        file.write_all(&256u32.to_le_bytes()).unwrap();
-        // Write block_count of 2.
-        file.write_all(&2u32.to_le_bytes()).unwrap();
-        // Write header cell IDs.
-        file.write_all(&0u32.to_le_bytes()).unwrap();
-        file.write_all(&1u32.to_le_bytes()).unwrap();
-        // Write absolute offsets.
-        file.write_all(&0u32.to_le_bytes()).unwrap();
-        // Write relative offsets.
-        file.write_all(&0u16.to_le_bytes()).unwrap();
-        file.write_all(&2u16.to_le_bytes()).unwrap();
-        // Write block bytes.
-        file.write_all(&[8, 0]).unwrap();
-    }
-
-    let result = QueryEngine::new(temporary_database);
-    assert!(result.is_err());
-    let error_message = result.err().unwrap().to_string();
-    assert!(
-        error_message.contains("terminal block offset")
-            && error_message.contains("must be less than physical data length"),
-        "Unexpected error: {}",
-        error_message
-    );
-    let _ = std::fs::remove_file(temporary_database);
-}
-
-/// Verifies that get_ancestor and try_get_ancestor correctly reject levels deeper than the cell's own level.
+/// Verifies that ancestor helpers reject levels deeper than the source cell.
 #[test]
 fn test_ancestor_level_boundaries() {
     use population_density::try_get_ancestor;
@@ -1205,11 +620,9 @@ fn test_ancestor_level_boundaries() {
     let cell_id = 0x1000000004000000u64;
     assert_eq!(get_level(cell_id), 17);
 
-    // level <= 17 should succeed.
     assert!(try_get_ancestor(cell_id, 17).is_ok());
     assert!(try_get_ancestor(cell_id, 10).is_ok());
 
-    // level > 17 should fail/panic.
     assert!(try_get_ancestor(cell_id, 18).is_err());
     assert!(try_get_ancestor(cell_id, 30).is_err());
 
@@ -1219,25 +632,17 @@ fn test_ancestor_level_boundaries() {
     assert!(result.is_err());
 }
 
-/// Independently verifies the core privacy invariant: for every populated query location, the cell
-/// the engine returns represents at least POPULATION_THRESHOLD people.
+/// Verifies returned cells meet the threshold in the GeoTIFF-derived population map.
 ///
-/// This guard sums population from the propagated TIFF-derived cell map (NaiveOracle::populations),
-/// NOT from the quadtree leaf set, so a pruning/threshold regression in find_leaves that returned a
-/// too-fine cell would be caught here even though it would be mirrored in the parity oracles.
+/// It uses propagated GeoTIFF populations rather than reconstructed leaves, so a
+/// pruning regression cannot be mirrored by the oracle.
 #[test]
 fn test_returned_cells_meet_population_threshold() {
-    let database_path = "../population_density_database.bin";
-    assert!(
-        std::path::Path::new(database_path).exists(),
-        "Database file '{}' not found. Please build the database first using 'cargo run --release --bin build_database'.",
-        database_path
-    );
-    let query_engine = QueryEngine::new(database_path).unwrap();
+    let database_path = database_path();
+    let query_engine = open_database(&database_path).unwrap();
     let oracle = &*SHARED_TIFF_ORACLE;
 
-    // Representative cities (resolve fine) plus a deterministic global grid covering dense, sparse,
-    // and ocean locations (resolve coarse). Every case must still represent >= the threshold.
+    // Cover dense, sparse, and ocean locations with a deterministic global grid.
     let mut query_points: Vec<(f64, f64)> = vec![
         (39.9042, 116.4074), // Beijing
         (51.5074, -0.1278),  // London
@@ -1275,31 +680,25 @@ fn test_returned_cells_meet_population_threshold() {
     }
 }
 
-/// Verifies that a memory mapping whose base is not 4-byte aligned (the case a non-4-aligned APK
-/// asset offset would produce) is rejected by from_mmap, rather than causing UB or a wrong result.
-/// The u32/u16 table casts require a 4-aligned base, so this must fail closed.
+/// Verifies that S2PD handles an unaligned memory mapping correctly.
+///
+/// S2PD reads byte fields, so an unaligned base must return the same query result.
 #[test]
-fn test_from_mmap_unaligned_base_rejected() {
+fn test_from_mmap_unaligned_base_handling() {
     use population_density::memmap2::MmapOptions;
 
-    let database_path = "../population_density_database.bin";
-    assert!(
-        std::path::Path::new(database_path).exists(),
-        "Database file '{}' not found.",
-        database_path
-    );
-    let database_bytes = std::fs::read(database_path).unwrap();
+    let database_path = database_path();
+    let database_bytes = std::fs::read(&database_path).unwrap();
+    assert!(database_bytes.starts_with(b"S2PD"));
 
-    // Prepend one pad byte so the database content starts at file offset 1.
-    std::fs::create_dir_all("scratch").unwrap();
-    let padded_path = "scratch/unaligned_padded.bin";
+    let padded_file = NamedTempFile::new().unwrap();
     let mut padded = Vec::with_capacity(database_bytes.len() + 1);
-    padded.push(0u8);
+    padded.push(0);
     padded.extend_from_slice(&database_bytes);
-    std::fs::write(padded_path, &padded).unwrap();
+    std::fs::write(padded_file.path(), &padded).unwrap();
 
-    let file = File::open(padded_path).unwrap();
-    // memmap2 anchors the mapping at the requested offset, so the base mirrors offset % 4 = 1.
+    let file = File::open(padded_file.path()).unwrap();
+    // SAFETY: The private temporary file remains unmodified while this mapping exists.
     let mmap = unsafe {
         MmapOptions::new()
             .offset(1)
@@ -1307,38 +706,27 @@ fn test_from_mmap_unaligned_base_rejected() {
             .map(&file)
             .unwrap()
     };
+    assert_eq!(mmap.as_ptr() as usize % 4, 1);
+    let unaligned_engine =
+        QueryEngine::from_mmap(mmap).expect("S2PD must support an unaligned mapping base");
+
+    let verified_file = File::open(padded_file.path()).unwrap();
+    // SAFETY: The private temporary file remains unmodified while this mapping exists.
+    let verified_mmap = unsafe {
+        MmapOptions::new()
+            .offset(1)
+            .len(database_bytes.len())
+            .map(&verified_file)
+            .unwrap()
+    };
+    let verified_unaligned_engine = QueryEngine::from_verified_mmap(verified_mmap)
+        .expect("verified S2PD must support an unaligned mapping base");
+    let aligned_engine = open_database(&database_path).unwrap();
+    let query_cell_id = CellID::from(LatLng::from_degrees(0.0, 0.0)).0;
+    let expected = aligned_engine.query(query_cell_id).unwrap();
+    assert_eq!(unaligned_engine.query(query_cell_id).unwrap(), expected);
     assert_eq!(
-        mmap.as_ptr() as usize % 4,
-        1,
-        "test setup expects an unaligned mapping base"
+        verified_unaligned_engine.query(query_cell_id).unwrap(),
+        expected
     );
-
-    let result = QueryEngine::from_mmap(mmap);
-    assert!(
-        result.is_err(),
-        "from_mmap must reject a non-4-aligned mapping base (fail-closed), got Ok"
-    );
-
-    let _ = std::fs::remove_file(padded_path);
-}
-
-/// Verifies from_mmap rejects a corrupt in-memory mapping directly. QueryEngine::new routes through
-/// from_mmap from files; this exercises the from_mmap buffer entry point on its own.
-#[test]
-fn test_from_mmap_bad_magic_rejected() {
-    use population_density::memmap2::MmapOptions;
-
-    std::fs::create_dir_all("scratch").unwrap();
-    let corrupt_path = "scratch/from_mmap_bad_magic.bin";
-    std::fs::write(corrupt_path, vec![0xFFu8; 64]).unwrap();
-
-    let file = File::open(corrupt_path).unwrap();
-    let mmap = unsafe { MmapOptions::new().map(&file).unwrap() };
-    let result = QueryEngine::from_mmap(mmap);
-    assert!(
-        result.is_err(),
-        "from_mmap must reject a buffer with invalid magic bytes"
-    );
-
-    let _ = std::fs::remove_file(corrupt_path);
 }
