@@ -75,3 +75,5 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
 Release mode keeps the exhaustive integration tests practical.
+The tests count allocations across deterministic valid queries and exercise the
+different full and preverified constructor validation boundaries.
