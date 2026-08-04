@@ -4,7 +4,7 @@
 //! level 12 S2 cells in parallel, propagates the values up the quadtree, and prunes
 //! cells below the population threshold to generate a compact database.
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use clap::Parser;
 use population_density::{
     MAX_DB_LEVEL, NUM_ROOT_FACES, POPULATION_THRESHOLD, S2_FACE_SHIFT, SHIFT_COMPACT, get_parent_id,
@@ -13,31 +13,72 @@ use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use s2::cellid::CellID;
 use s2::latlng::LatLng;
-use std::fs::File;
-use std::io::BufReader;
-use std::path::PathBuf;
+use sha2::{Digest, Sha256};
+use std::fs::{File, OpenOptions};
+use std::io::{BufReader, Read, Write};
+use std::path::{Path, PathBuf};
 use std::time::Instant;
+use tempfile::{Builder, TempDir};
+use tiff::ColorType;
 use tiff::decoder::{Decoder, DecodingResult, Limits};
+use tiff::tags::Tag;
 
 use population_density_cli::{
-    add_population, convert_population_to_fixed, open_database_snapshot, write_topology_database,
+    add_population, convert_population_to_fixed, geotiff, open_database_snapshot,
+    write_topology_database,
 };
 
-#[path = "../geotiff.rs"]
-mod geotiff;
 #[path = "../quadtree.rs"]
 mod quadtree;
 
 use quadtree::{LEVEL_0_SENTINEL_SHIFT, find_leaves};
 
-/// Configures GeoTIFF spatial parameters for coordinates and cell aggregation.
+const SOURCE_GEOTIFF_SHA256: [u8; 32] = [
+    0xbd, 0xfe, 0x70, 0x81, 0x50, 0x6b, 0xd6, 0x12, 0x3d, 0x43, 0xa2, 0x9f, 0x22, 0xcf, 0x75, 0xcc,
+    0xdd, 0x6e, 0xa5, 0xfe, 0xe3, 0xfd, 0xf7, 0xc3, 0xe9, 0x83, 0x5d, 0xeb, 0xf7, 0x1c, 0x6b, 0xc3,
+];
+const SHA256_BUFFER_SIZE: usize = 64 * 1024;
+const SOURCE_SNAPSHOT_DIRECTORY_PREFIX: &str = "population-density-source-";
+const SOURCE_SNAPSHOT_FILENAME: &str = "source.tif";
+const GEOTIFF_WIDTH: u32 = 43_200;
+const GEOTIFF_HEIGHT: u32 = 17_280;
 const GEOTIFF_MAX_LATITUDE: f64 = 84.0;
 const GEOTIFF_MIN_LONGITUDE: f64 = -180.0;
-const GEOTIFF_PIXEL_SCALE: f64 = 0.008333333333333333;
+/// Defines the nominal 30-arc-second scale used for pixel-center coordinates.
+const GEOTIFF_PIXEL_SCALE: f64 = 1.0 / 120.0;
+/// Defines the decimal scale stored by the pinned GeoTIFF.
+const GEOTIFF_METADATA_PIXEL_SCALE: f64 = 0.0083333333;
 const PIXEL_CENTER_OFFSET: f64 = 0.5;
 const GEOTIFF_NODATA_VALUE: f32 = -99999.0;
-/// Bounds the allowed deviation of the GeoTIFF origin and pixel scale from the assumed grid.
-const GEOREFERENCE_TOLERANCE: f64 = 1e-6;
+const GEOTIFF_NODATA_TEXT: &str = "-99999";
+const GEOTIFF_BITS_PER_SAMPLE: [u16; 1] = [32];
+const GEOTIFF_SAMPLES_PER_PIXEL: u16 = 1;
+const GEOTIFF_SAMPLE_FORMAT: [u16; 1] = [3];
+const GEOTIFF_PHOTOMETRIC_INTERPRETATION: u16 = 1;
+const GEOTIFF_PLANAR_CONFIGURATION: u16 = 1;
+const GEOTIFF_COMPRESSION: u16 = 5;
+const GEOTIFF_PREDICTOR: u16 = 1;
+const GEOTIFF_TILE_WIDTH: u32 = 512;
+const GEOTIFF_TILE_HEIGHT: u32 = 512;
+const GEOTIFF_PIXEL_SCALE_TAG: [f64; 3] = [
+    GEOTIFF_METADATA_PIXEL_SCALE,
+    GEOTIFF_METADATA_PIXEL_SCALE,
+    0.0,
+];
+const GEOTIFF_TIEPOINT_TAG: [f64; 6] = [
+    0.0,
+    0.0,
+    0.0,
+    GEOTIFF_MIN_LONGITUDE,
+    GEOTIFF_MAX_LATITUDE,
+    0.0,
+];
+const GEOTIFF_KEY_DIRECTORY: [u16; 32] = [
+    1, 1, 0, 7, 1024, 0, 1, 2, 1025, 0, 1, 1, 2048, 0, 1, 4326, 2049, 34737, 7, 0, 2054, 0, 1,
+    9102, 2057, 34736, 1, 1, 2059, 34736, 1, 0,
+];
+const GEOTIFF_DOUBLE_PARAMETERS: [f64; 2] = [298.257223563, 6_378_137.0];
+const GEOTIFF_ASCII_PARAMETERS: &str = "WGS 84|";
 
 /// Holds the command-line arguments for building the S2 population density database.
 #[derive(Parser, Debug)]
@@ -62,60 +103,288 @@ struct Arguments {
     database_path: PathBuf,
 }
 
-/// Validates that the GeoTIFF origin and pixel scale match the assumed aggregation grid.
-fn validate_georeferencing<R: std::io::Read + std::io::Seek>(
-    decoder: &mut Decoder<R>,
+/// Owns a private read-only snapshot of the source GeoTIFF.
+struct SourceGeoTiffSnapshot {
+    path: PathBuf,
+    _temporary_directory: TempDir,
+}
+
+impl SourceGeoTiffSnapshot {
+    /// Stages and validates the pinned source GeoTIFF.
+    fn stage(source_path: &Path) -> Result<Self> {
+        Self::stage_with_digest(source_path, &SOURCE_GEOTIFF_SHA256)
+    }
+
+    /// Stages a source GeoTIFF and requires the expected digest.
+    fn stage_with_digest(source_path: &Path, expected_digest: &[u8; 32]) -> Result<Self> {
+        let mut source_file = File::open(source_path).with_context(|| {
+            format!("failed to open source GeoTIFF '{}'", source_path.display())
+        })?;
+        let temporary_directory = Builder::new()
+            .prefix(SOURCE_SNAPSHOT_DIRECTORY_PREFIX)
+            .tempdir()
+            .context("failed to create a source GeoTIFF snapshot directory")?;
+        let snapshot_path = temporary_directory.path().join(SOURCE_SNAPSHOT_FILENAME);
+        let mut snapshot_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&snapshot_path)
+            .with_context(|| {
+                format!(
+                    "failed to create source GeoTIFF snapshot '{}'",
+                    snapshot_path.display()
+                )
+            })?;
+
+        let actual_digest = copy_and_calculate_sha256(&mut source_file, &mut snapshot_file)?;
+        snapshot_file.flush()?;
+        snapshot_file.sync_all()?;
+        validate_source_digest(&actual_digest, expected_digest)?;
+
+        let mut permissions = snapshot_file.metadata()?.permissions();
+        permissions.set_readonly(true);
+        snapshot_file.set_permissions(permissions)?;
+        drop(snapshot_file);
+
+        Ok(Self {
+            path: snapshot_path,
+            _temporary_directory: temporary_directory,
+        })
+    }
+
+    /// Returns the immutable snapshot path.
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// Stores source metadata used by pixel-to-coordinate conversion.
+#[derive(Clone, Debug, PartialEq)]
+struct GeoTiffMetadata {
+    dimensions: (u32, u32),
+    color_type: ColorType,
+    bits_per_sample: Vec<u16>,
+    samples_per_pixel: u16,
+    sample_format: Vec<u16>,
+    photometric_interpretation: u16,
+    planar_configuration: u16,
+    compression: u16,
+    predictor: u16,
+    tile_width: u32,
+    tile_height: u32,
+    pixel_scale: Vec<f64>,
+    tiepoint: Vec<f64>,
+    key_directory: Vec<u16>,
+    double_parameters: Vec<f64>,
+    ascii_parameters: String,
+    nodata: String,
+    has_additional_images: bool,
+}
+
+impl GeoTiffMetadata {
+    /// Reads the required metadata from a GeoTIFF decoder.
+    fn read<R: Read + std::io::Seek>(decoder: &mut Decoder<R>) -> Result<Self> {
+        Ok(Self {
+            dimensions: decoder
+                .dimensions()
+                .context("failed to read TIFF dimensions")?,
+            color_type: decoder
+                .colortype()
+                .context("failed to read TIFF color type")?,
+            bits_per_sample: decoder
+                .get_tag_u16_vec(Tag::BitsPerSample)
+                .context("missing or invalid TIFF BitsPerSample tag")?,
+            samples_per_pixel: decoder
+                .get_tag_unsigned(Tag::SamplesPerPixel)
+                .context("missing or invalid TIFF SamplesPerPixel tag")?,
+            sample_format: decoder
+                .get_tag_u16_vec(Tag::SampleFormat)
+                .context("missing or invalid TIFF SampleFormat tag")?,
+            photometric_interpretation: decoder
+                .get_tag_unsigned(Tag::PhotometricInterpretation)
+                .context("missing or invalid TIFF PhotometricInterpretation tag")?,
+            planar_configuration: decoder
+                .get_tag_unsigned(Tag::PlanarConfiguration)
+                .context("missing or invalid TIFF PlanarConfiguration tag")?,
+            compression: decoder
+                .get_tag_unsigned(Tag::Compression)
+                .context("missing or invalid TIFF Compression tag")?,
+            predictor: decoder
+                .get_tag_unsigned(Tag::Predictor)
+                .context("missing or invalid TIFF Predictor tag")?,
+            tile_width: decoder
+                .get_tag_unsigned(Tag::TileWidth)
+                .context("missing or invalid TIFF TileWidth tag")?,
+            tile_height: decoder
+                .get_tag_unsigned(Tag::TileLength)
+                .context("missing or invalid TIFF TileLength tag")?,
+            pixel_scale: decoder
+                .get_tag_f64_vec(Tag::ModelPixelScaleTag)
+                .context("missing or invalid GeoTIFF ModelPixelScaleTag")?,
+            tiepoint: decoder
+                .get_tag_f64_vec(Tag::ModelTiepointTag)
+                .context("missing or invalid GeoTIFF ModelTiepointTag")?,
+            key_directory: decoder
+                .get_tag_u16_vec(Tag::GeoKeyDirectoryTag)
+                .context("missing or invalid GeoTIFF GeoKeyDirectoryTag")?,
+            double_parameters: decoder
+                .get_tag_f64_vec(Tag::GeoDoubleParamsTag)
+                .context("missing or invalid GeoTIFF GeoDoubleParamsTag")?,
+            ascii_parameters: decoder
+                .get_tag_ascii_string(Tag::GeoAsciiParamsTag)
+                .context("missing or invalid GeoTIFF GeoAsciiParamsTag")?,
+            nodata: decoder
+                .get_tag_ascii_string(Tag::GdalNodata)
+                .context("missing or invalid GeoTIFF GDAL_NODATA tag")?,
+            has_additional_images: decoder.more_images(),
+        })
+    }
+
+    /// Validates the exact metadata required by the pinned source dataset.
+    fn validate(&self) -> Result<()> {
+        require_metadata(
+            "dimensions",
+            &self.dimensions,
+            &(GEOTIFF_WIDTH, GEOTIFF_HEIGHT),
+        )?;
+        require_metadata("color type", &self.color_type, &ColorType::Gray(32))?;
+        require_metadata(
+            "bits per sample",
+            self.bits_per_sample.as_slice(),
+            GEOTIFF_BITS_PER_SAMPLE.as_slice(),
+        )?;
+        require_metadata(
+            "samples per pixel",
+            &self.samples_per_pixel,
+            &GEOTIFF_SAMPLES_PER_PIXEL,
+        )?;
+        require_metadata(
+            "sample format",
+            self.sample_format.as_slice(),
+            GEOTIFF_SAMPLE_FORMAT.as_slice(),
+        )?;
+        require_metadata(
+            "photometric interpretation",
+            &self.photometric_interpretation,
+            &GEOTIFF_PHOTOMETRIC_INTERPRETATION,
+        )?;
+        require_metadata(
+            "planar configuration",
+            &self.planar_configuration,
+            &GEOTIFF_PLANAR_CONFIGURATION,
+        )?;
+        require_metadata("compression", &self.compression, &GEOTIFF_COMPRESSION)?;
+        require_metadata("predictor", &self.predictor, &GEOTIFF_PREDICTOR)?;
+        require_metadata("tile width", &self.tile_width, &GEOTIFF_TILE_WIDTH)?;
+        require_metadata("tile height", &self.tile_height, &GEOTIFF_TILE_HEIGHT)?;
+        require_metadata(
+            "pixel scale",
+            self.pixel_scale.as_slice(),
+            GEOTIFF_PIXEL_SCALE_TAG.as_slice(),
+        )?;
+        require_metadata(
+            "tiepoint",
+            self.tiepoint.as_slice(),
+            GEOTIFF_TIEPOINT_TAG.as_slice(),
+        )?;
+        require_metadata(
+            "GeoKey directory",
+            self.key_directory.as_slice(),
+            GEOTIFF_KEY_DIRECTORY.as_slice(),
+        )?;
+        require_metadata(
+            "double parameters",
+            self.double_parameters.as_slice(),
+            GEOTIFF_DOUBLE_PARAMETERS.as_slice(),
+        )?;
+        require_metadata(
+            "ASCII parameters",
+            self.ascii_parameters.as_str(),
+            GEOTIFF_ASCII_PARAMETERS,
+        )?;
+        require_metadata("NoData value", self.nodata.as_str(), GEOTIFF_NODATA_TEXT)?;
+        require_metadata(
+            "additional image presence",
+            &self.has_additional_images,
+            &false,
+        )
+    }
+}
+
+/// Requires one metadata field to match its pinned value.
+fn require_metadata<T: std::fmt::Debug + PartialEq + ?Sized>(
+    name: &str,
+    actual: &T,
+    expected: &T,
 ) -> Result<()> {
-    let pixel_scale = decoder
-        .get_tag_f64_vec(tiff::tags::Tag::ModelPixelScaleTag)
-        .map_err(|error| {
-            anyhow!(
-                "missing or unreadable GeoTIFF ModelPixelScaleTag (33550): {}",
-                error
-            )
-        })?;
-    let tiepoint = decoder
-        .get_tag_f64_vec(tiff::tags::Tag::ModelTiepointTag)
-        .map_err(|error| {
-            anyhow!(
-                "missing or unreadable GeoTIFF ModelTiepointTag (33922): {}",
-                error
-            )
-        })?;
-
-    if pixel_scale.len() < 2
-        || (pixel_scale[0] - GEOTIFF_PIXEL_SCALE).abs() > GEOREFERENCE_TOLERANCE
-        || (pixel_scale[1] - GEOTIFF_PIXEL_SCALE).abs() > GEOREFERENCE_TOLERANCE
-    {
-        return Err(anyhow!(
-            "GeoTIFF pixel scale {:?} does not match the assumed {} degrees per pixel",
-            pixel_scale,
-            GEOTIFF_PIXEL_SCALE
-        ));
-    }
-
-    // ModelTiepointTag stores a raster point (i, j, k) mapped to a model point (x, y, z); the
-    // builder assumes raster origin (0, 0) maps to (GEOTIFF_MIN_LONGITUDE, GEOTIFF_MAX_LATITUDE).
-    if tiepoint.len() < 6
-        || tiepoint[0].abs() > GEOREFERENCE_TOLERANCE
-        || tiepoint[1].abs() > GEOREFERENCE_TOLERANCE
-        || (tiepoint[3] - GEOTIFF_MIN_LONGITUDE).abs() > GEOREFERENCE_TOLERANCE
-        || (tiepoint[4] - GEOTIFF_MAX_LATITUDE).abs() > GEOREFERENCE_TOLERANCE
-    {
-        return Err(anyhow!(
-            "GeoTIFF tiepoint {:?} does not match the assumed origin (longitude {}, latitude {})",
-            tiepoint,
-            GEOTIFF_MIN_LONGITUDE,
-            GEOTIFF_MAX_LATITUDE
-        ));
-    }
-
+    ensure!(
+        actual == expected,
+        "GeoTIFF {name} {actual:?} does not match expected {expected:?}"
+    );
     Ok(())
 }
 
-/// Extracts the leaves of the pruned quadtree for all S2 faces, requiring every face to yield at
-/// least one leaf. Returns an error if any face's total population is below the threshold, since a
-/// whole face with no cells would leave that region with no coarsening cell on-device.
+/// Copies a reader while calculating its SHA-256 digest.
+fn copy_and_calculate_sha256(mut reader: impl Read, mut writer: impl Write) -> Result<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; SHA256_BUFFER_SIZE];
+    loop {
+        let bytes_read = reader.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+        writer.write_all(&buffer[..bytes_read])?;
+    }
+    Ok(hasher.finalize().into())
+}
+
+/// Formats a SHA-256 digest as lowercase hexadecimal.
+fn format_sha256(digest: &[u8; 32]) -> String {
+    use std::fmt::Write;
+
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut output, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    output
+}
+
+/// Requires a source digest to match its expected value.
+fn validate_source_digest(actual_digest: &[u8; 32], expected_digest: &[u8; 32]) -> Result<()> {
+    ensure!(
+        actual_digest == expected_digest,
+        "source GeoTIFF SHA-256 {} does not match pinned {}",
+        format_sha256(actual_digest),
+        format_sha256(expected_digest)
+    );
+    Ok(())
+}
+
+/// Validates the pinned source metadata.
+fn validate_source_metadata(path: &Path) -> Result<()> {
+    let metadata_file = File::open(path)?;
+    let mut decoder = Decoder::new(BufReader::new(metadata_file))?.with_limits(Limits::unlimited());
+    GeoTiffMetadata::read(&mut decoder)?.validate()
+}
+
+/// Converts one valid source pixel to fixed-point population units.
+fn convert_source_population(population: f32) -> Result<Option<i64>> {
+    if population == GEOTIFF_NODATA_VALUE || population == 0.0 {
+        return Ok(None);
+    }
+    ensure!(
+        population.is_finite() && population > 0.0,
+        "source population value must be finite, non-negative, or NoData: {}",
+        population
+    );
+    Ok(Some(convert_population_to_fixed(population)?))
+}
+
+/// Extracts pruned quadtree leaves for every S2 face.
+///
+/// Returns an error if a face's total population is below the threshold because that region would
+/// have no coarsening cell on-device.
 fn extract_pruned_leaves(cell_populations: &FxHashMap<u64, i64>) -> Result<Vec<u64>> {
     let face_ids: Vec<u64> = (0..NUM_ROOT_FACES)
         .map(|face| ((face as u64) << S2_FACE_SHIFT) | (1u64 << LEVEL_0_SENTINEL_SHIFT))
@@ -150,50 +419,41 @@ fn main() -> Result<()> {
     // 1. GeoTIFF reading and pixel aggregation.
     println!("Step 1: Reading GeoTIFF and aggregating population into level 12 S2 cells...");
 
-    if !arguments.tiff_path.exists() {
-        return Err(anyhow!(
-            "input TIFF file '{}' not found; see the Data source section in README.md",
-            arguments.tiff_path.display()
-        ));
-    }
-
-    // Validate the GeoTIFF georeferencing against the assumed grid before the expensive
-    // aggregation, so a file with a different origin or resolution fails fast instead of
-    // silently mapping every pixel to the wrong S2 cell. This reads the original file because
-    // the on-the-fly tiffcp recompression below drops the GeoTIFF geo tags.
-    {
-        let georeference_file = File::open(&arguments.tiff_path)?;
-        let mut georeference_decoder =
-            Decoder::new(BufReader::new(georeference_file))?.with_limits(Limits::unlimited());
-        validate_georeferencing(&mut georeference_decoder)?;
-    }
-
-    let prepared_tiff = geotiff::prepare_geotiff(&arguments.tiff_path)?;
+    let source_snapshot = SourceGeoTiffSnapshot::stage(&arguments.tiff_path)?;
+    validate_source_metadata(source_snapshot.path())?;
+    let prepared_tiff = geotiff::prepare_geotiff(source_snapshot.path())?;
 
     let file = File::open(prepared_tiff.path())?;
     let mut decoder = Decoder::new(BufReader::new(file))?.with_limits(Limits::unlimited());
 
     let (width, height) = decoder.dimensions()?;
+    require_metadata(
+        "prepared dimensions",
+        &(width, height),
+        &(GEOTIFF_WIDTH, GEOTIFF_HEIGHT),
+    )?;
     println!("Image Dimensions: {} x {}", width, height);
 
     let color_type = decoder.colortype()?;
+    require_metadata("prepared color type", &color_type, &ColorType::Gray(32))?;
     println!("Image Color Type: {:?}", color_type);
 
     let image_result = decoder.read_image()?;
     println!("GeoTIFF decoded in {:.2?}.", start_time.elapsed());
+    let width_usize = usize::try_from(width)?;
+    let height_usize = usize::try_from(height)?;
+    let expected_pixel_count = width_usize
+        .checked_mul(height_usize)
+        .ok_or_else(|| anyhow!("GeoTIFF dimensions exceed the addressable range"))?;
 
     let data = match image_result {
-        DecodingResult::F32(vec) => {
-            if vec.len() != (width as usize) * (height as usize) {
-                return Err(anyhow!(
-                    "decoded image data vector length {} does not match expected size {} x {} = {}",
-                    vec.len(),
-                    width,
-                    height,
-                    (width as usize) * (height as usize)
-                ));
-            }
-            vec
+        DecodingResult::F32(data) => {
+            ensure!(
+                data.len() == expected_pixel_count,
+                "decoded image length {} does not match {width} x {height} = {expected_pixel_count}",
+                data.len()
+            );
+            data
         }
         _ => return Err(anyhow!("unexpected image data type (expected Float32)")),
     };
@@ -201,27 +461,28 @@ fn main() -> Result<()> {
     let aggregation_start_time = Instant::now();
     println!("Aggregating pixels in parallel using rayon...");
 
-    let width_usize = width as usize;
-    let level_12_populations = (0..height as usize)
+    let level_12_populations = (0..height_usize)
         .into_par_iter()
         .try_fold(FxHashMap::default, |mut local_map, pixel_y| -> Result<_> {
             let row_offset = pixel_y * width_usize;
             let pixel_y_float = pixel_y as f64;
             for pixel_x in 0..width_usize {
                 let value = data[row_offset + pixel_x];
-                if value.is_finite() && value > 0.0 && value != GEOTIFF_NODATA_VALUE {
-                    let latitude = GEOTIFF_MAX_LATITUDE
-                        - (pixel_y_float + PIXEL_CENTER_OFFSET) * GEOTIFF_PIXEL_SCALE;
-                    let longitude = GEOTIFF_MIN_LONGITUDE
-                        + ((pixel_x as f64) + PIXEL_CENTER_OFFSET) * GEOTIFF_PIXEL_SCALE;
-                    let latitude_longitude = LatLng::from_degrees(latitude, longitude);
-                    let cell_id = CellID::from(latitude_longitude).parent(MAX_DB_LEVEL as u64);
-                    // Accumulate in fixed-point integer units so the parallel reduction is
-                    // associative and the build is bit-for-bit reproducible regardless of the
-                    // rayon work-stealing split (f64 addition is not associative).
-                    let fixed_population = convert_population_to_fixed(value)?;
-                    add_population(&mut local_map, cell_id.0, fixed_population)?;
-                }
+                let Some(fixed_population) =
+                    convert_source_population(value).with_context(|| {
+                        format!("invalid source population at pixel ({pixel_x}, {pixel_y})")
+                    })?
+                else {
+                    continue;
+                };
+                let latitude = GEOTIFF_MAX_LATITUDE
+                    - (pixel_y_float + PIXEL_CENTER_OFFSET) * GEOTIFF_PIXEL_SCALE;
+                let longitude = GEOTIFF_MIN_LONGITUDE
+                    + ((pixel_x as f64) + PIXEL_CENTER_OFFSET) * GEOTIFF_PIXEL_SCALE;
+                let latitude_longitude = LatLng::from_degrees(latitude, longitude);
+                let cell_id = CellID::from(latitude_longitude).parent(MAX_DB_LEVEL as u64);
+                // Accumulate fixed-point values so parallel reduction remains associative.
+                add_population(&mut local_map, cell_id.0, fixed_population)?;
             }
             Ok(local_map)
         })
@@ -333,6 +594,132 @@ fn main() -> Result<()> {
 mod tests {
     use super::*;
     use population_density::POPULATION_FIXED_POINT_SCALE;
+    use std::io::Cursor;
+
+    /// Returns metadata matching the pinned GeoTIFF.
+    fn pinned_metadata() -> GeoTiffMetadata {
+        GeoTiffMetadata {
+            dimensions: (GEOTIFF_WIDTH, GEOTIFF_HEIGHT),
+            color_type: ColorType::Gray(32),
+            bits_per_sample: GEOTIFF_BITS_PER_SAMPLE.to_vec(),
+            samples_per_pixel: GEOTIFF_SAMPLES_PER_PIXEL,
+            sample_format: GEOTIFF_SAMPLE_FORMAT.to_vec(),
+            photometric_interpretation: GEOTIFF_PHOTOMETRIC_INTERPRETATION,
+            planar_configuration: GEOTIFF_PLANAR_CONFIGURATION,
+            compression: GEOTIFF_COMPRESSION,
+            predictor: GEOTIFF_PREDICTOR,
+            tile_width: GEOTIFF_TILE_WIDTH,
+            tile_height: GEOTIFF_TILE_HEIGHT,
+            pixel_scale: GEOTIFF_PIXEL_SCALE_TAG.to_vec(),
+            tiepoint: GEOTIFF_TIEPOINT_TAG.to_vec(),
+            key_directory: GEOTIFF_KEY_DIRECTORY.to_vec(),
+            double_parameters: GEOTIFF_DOUBLE_PARAMETERS.to_vec(),
+            ascii_parameters: GEOTIFF_ASCII_PARAMETERS.to_owned(),
+            nodata: GEOTIFF_NODATA_TEXT.to_owned(),
+            has_additional_images: false,
+        }
+    }
+
+    /// Verifies SHA-256 calculation and pinned-digest enforcement.
+    #[test]
+    fn source_digest_validation_is_exact() {
+        let mut copied_bytes = Vec::new();
+        let abc_digest = copy_and_calculate_sha256(Cursor::new(b"abc"), &mut copied_bytes).unwrap();
+        assert_eq!(copied_bytes, b"abc");
+        assert_eq!(
+            format_sha256(&abc_digest),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        validate_source_digest(&SOURCE_GEOTIFF_SHA256, &SOURCE_GEOTIFF_SHA256).unwrap();
+        assert!(validate_source_digest(&[0u8; 32], &SOURCE_GEOTIFF_SHA256).is_err());
+    }
+
+    /// Verifies source mutation and replacement cannot change a staged snapshot.
+    #[test]
+    fn source_snapshot_isolated_from_source_path_changes() {
+        let source_directory = tempfile::tempdir().unwrap();
+        let source_path = source_directory.path().join("source.tif");
+        let replacement_path = source_directory.path().join("replacement.tif");
+        let reviewed_source = b"reviewed deterministic source";
+        std::fs::write(&source_path, reviewed_source).unwrap();
+
+        let mut digest_input = Vec::new();
+        let expected_digest =
+            copy_and_calculate_sha256(Cursor::new(reviewed_source), &mut digest_input).unwrap();
+        assert_eq!(digest_input, reviewed_source);
+        let snapshot =
+            SourceGeoTiffSnapshot::stage_with_digest(&source_path, &expected_digest).unwrap();
+        assert!(
+            std::fs::metadata(snapshot.path())
+                .unwrap()
+                .permissions()
+                .readonly()
+        );
+
+        std::fs::write(&source_path, b"mutated source").unwrap();
+        assert_eq!(std::fs::read(snapshot.path()).unwrap(), reviewed_source);
+
+        std::fs::write(&replacement_path, b"replacement source").unwrap();
+        std::fs::rename(&replacement_path, &source_path).unwrap();
+        assert_eq!(std::fs::read(snapshot.path()).unwrap(), reviewed_source);
+
+        let snapshot_path = snapshot.path().to_path_buf();
+        drop(snapshot);
+        assert!(!snapshot_path.exists());
+    }
+
+    /// Verifies every pinned source metadata field is required exactly.
+    #[test]
+    fn source_metadata_validation_is_exact() {
+        pinned_metadata().validate().unwrap();
+
+        macro_rules! assert_rejected {
+            ($field:ident, $value:expr) => {{
+                let mut metadata = pinned_metadata();
+                metadata.$field = $value;
+                assert!(metadata.validate().is_err(), stringify!($field));
+            }};
+        }
+
+        assert_rejected!(dimensions, (GEOTIFF_WIDTH - 1, GEOTIFF_HEIGHT));
+        assert_rejected!(color_type, ColorType::Gray(16));
+        assert_rejected!(bits_per_sample, vec![16]);
+        assert_rejected!(samples_per_pixel, 2);
+        assert_rejected!(sample_format, vec![1]);
+        assert_rejected!(photometric_interpretation, 0);
+        assert_rejected!(planar_configuration, 2);
+        assert_rejected!(compression, 8);
+        assert_rejected!(predictor, 2);
+        assert_rejected!(tile_width, GEOTIFF_TILE_WIDTH / 2);
+        assert_rejected!(tile_height, GEOTIFF_TILE_HEIGHT / 2);
+        assert_rejected!(pixel_scale, vec![GEOTIFF_PIXEL_SCALE, 0.0, 0.0]);
+        assert_rejected!(tiepoint, vec![0.0; GEOTIFF_TIEPOINT_TAG.len()]);
+        assert_rejected!(key_directory, vec![1, 1, 0, 0]);
+        assert_rejected!(
+            double_parameters,
+            vec![GEOTIFF_DOUBLE_PARAMETERS[1], GEOTIFF_DOUBLE_PARAMETERS[0]]
+        );
+        assert_rejected!(ascii_parameters, "WGS 72|".to_owned());
+        assert_rejected!(nodata, "nan".to_owned());
+        assert_rejected!(has_additional_images, true);
+    }
+
+    /// Verifies source population values reject undocumented sentinels.
+    #[test]
+    fn source_population_validation_is_exact() {
+        assert_eq!(
+            convert_source_population(GEOTIFF_NODATA_VALUE).unwrap(),
+            None
+        );
+        assert_eq!(convert_source_population(0.0).unwrap(), None);
+        assert_eq!(
+            convert_source_population(1.5).unwrap(),
+            Some(POPULATION_FIXED_POINT_SCALE + POPULATION_FIXED_POINT_SCALE / 2)
+        );
+        for invalid_population in [-1.0, f32::NEG_INFINITY, f32::INFINITY, f32::NAN] {
+            assert!(convert_source_population(invalid_population).is_err());
+        }
+    }
 
     /// Verifies that population conversion preserves normal fixed-point values.
     #[test]
@@ -393,8 +780,7 @@ mod tests {
         assert_eq!(cell_populations[&CELL_ID], i64::MAX);
     }
 
-    /// Verifies that leaf extraction requires every S2 face to be populated, failing loudly if any
-    /// face is empty (which would leave a whole region with no coarsening cell on-device).
+    /// Verifies that leaf extraction requires every S2 face to be populated.
     #[test]
     fn test_extract_pruned_leaves_requires_every_face() {
         use population_density::POPULATION_THRESHOLD_FIXED;

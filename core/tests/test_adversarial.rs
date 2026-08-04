@@ -1,4 +1,4 @@
-//! Exercises adversarial S2PD inputs and S2 boundaries.
+//! Exercises adversarial S2PD inputs, S2 boundaries, and builder failures.
 
 mod common;
 
@@ -8,12 +8,18 @@ use population_density::topology_format::{
     VERSION_OFFSET,
 };
 use population_density::{MAX_S2_LEVEL, get_children_ids, try_get_ancestor, try_get_level};
+use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use tempfile::{Builder, NamedTempFile};
+use tiff::encoder::{TiffEncoder, colortype};
 
 const GENERATED_DATABASE_PATH: &str = "../population_density_database.bin";
 const PACKAGED_DATABASE_PATH: &str =
     "../../../packages/apps/NetworkLocation/res/raw/population_density_database.bin";
+const GEOTIFF_PIXEL_SCALE: f64 = 1.0 / 120.0;
+const GEOTIFF_MIN_LONGITUDE: f64 = -180.0;
+const GEOTIFF_MAX_LATITUDE: f64 = 84.0;
 const DECLARED_SIZE_INCREMENT: u32 = 1;
 
 /// Describes one named database-byte mutation.
@@ -63,6 +69,82 @@ impl TemporaryFile {
     fn write(&self, bytes: &[u8]) {
         std::fs::write(self.file.path(), bytes).unwrap();
     }
+}
+
+/// Manages a builder test's temporary input and output files.
+struct BuilderTestFiles {
+    tiff: TemporaryFile,
+    database: TemporaryFile,
+}
+
+impl BuilderTestFiles {
+    /// Creates unique temporary paths for a builder test.
+    fn new(name: &str) -> Self {
+        Self {
+            tiff: TemporaryFile::new(name, "tif"),
+            database: TemporaryFile::new(name, "bin"),
+        }
+    }
+
+    /// Returns the temporary GeoTIFF path.
+    fn tiff_path(&self) -> &Path {
+        self.tiff.path()
+    }
+
+    /// Returns the temporary database path.
+    fn database_path(&self) -> &Path {
+        self.database.path()
+    }
+}
+
+/// Writes a mock GeoTIFF matching the builder's aggregation grid.
+fn write_mock_tiff(path: &Path, width: u32, height: u32, data: &[f32]) {
+    let file = File::create(path).unwrap();
+    let mut encoder = TiffEncoder::new(file).unwrap();
+    let mut image = encoder
+        .new_image::<colortype::Gray32Float>(width, height)
+        .unwrap();
+    image
+        .encoder()
+        .write_tag(
+            tiff::tags::Tag::ModelPixelScaleTag,
+            &[GEOTIFF_PIXEL_SCALE, GEOTIFF_PIXEL_SCALE, 0.0][..],
+        )
+        .unwrap();
+    image
+        .encoder()
+        .write_tag(
+            tiff::tags::Tag::ModelTiepointTag,
+            &[
+                0.0,
+                0.0,
+                0.0,
+                GEOTIFF_MIN_LONGITUDE,
+                GEOTIFF_MAX_LATITUDE,
+                0.0,
+            ][..],
+        )
+        .unwrap();
+    image.write_data(data).unwrap();
+}
+
+/// Runs the database builder for a synthetic GeoTIFF.
+fn run_builder(files: &BuilderTestFiles) -> std::process::Output {
+    Command::new("cargo")
+        .args([
+            "run",
+            "--package",
+            "population-density-cli",
+            "--bin",
+            "build_database",
+            "--",
+            "--tiff-path",
+            files.tiff_path().to_str().unwrap(),
+            "--database-path",
+            files.database_path().to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to execute database builder")
 }
 
 /// Verifies that structural S2PD header corruption is rejected.
@@ -192,4 +274,20 @@ fn test_query_rejects_invalid_cell_ids() {
     ] {
         assert!(query_engine.query(invalid_cell_id).is_err());
     }
+}
+
+/// Verifies that the builder rejects a source outside the pinned dataset.
+#[test]
+fn test_builder_rejects_unpinned_source() {
+    let files = BuilderTestFiles::new("unpinned");
+    write_mock_tiff(files.tiff_path(), 2, 2, &[0.0; 4]);
+
+    let output = run_builder(&files);
+    assert!(!output.status.success());
+    let standard_error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        standard_error.contains("source GeoTIFF SHA-256")
+            && standard_error.contains("does not match pinned"),
+        "builder must reject an unpinned source: {standard_error}"
+    );
 }

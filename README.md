@@ -18,7 +18,9 @@ The database is generated from this WorldPop dataset:
 - SHA-256: `bdfe7081506bd6123d43a29f22cf75ccdd6ea5fee3fdf7c3e9835debf71c6bc3`
 - Download: [WorldPop Hub - global_pop_2026](https://hub.worldpop.org/geodata/summary?id=80032)
 
-Verify the downloaded file with `sha256sum` before building. The pipeline aggregates pixel centers into level 12 S2 cells, accumulates population in deterministic fixed-point units, propagates values up the quadtree, and prunes cells below the 1,000-person threshold.
+The builder copies the input into a private read-only snapshot while calculating and enforcing this digest. Metadata validation, conversion, and decoding use only that snapshot. The builder also requires the reviewed image dimensions, Float32 grayscale layout, LZW tiling, WGS 84 / EPSG:4326 GeoTIFF metadata, PixelIsArea raster type, grid origin and scale, and `-99999` NoData value. Pixels must be finite and non-negative unless they equal the NoData sentinel.
+
+The pipeline aggregates pixel centers into level 12 S2 cells, accumulates population in deterministic fixed-point units, propagates values up the quadtree, and prunes cells below the 1,000-person threshold.
 
 ## Building and verifying
 

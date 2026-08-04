@@ -10,5 +10,6 @@ population-density = { path = "../core" }
 rayon.workspace = true
 rustc-hash.workspace = true
 s2.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
 tiff.workspace = true
