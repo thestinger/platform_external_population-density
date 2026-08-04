@@ -572,6 +572,13 @@ fn test_assert_preconditions_panic() {
         get_ancestor(1, 31);
     });
     assert!(result.is_err());
+
+    // Require the supplied child-parent level to match the cell ID.
+    let level_0_cell_id = 1u64 << 60;
+    let result = std::panic::catch_unwind(|| {
+        get_children_ids(level_0_cell_id, 1);
+    });
+    assert!(result.is_err());
 }
 
 /// Verifies that a database block with bit_width > 28 is detected as corrupt during query and reconstruction.

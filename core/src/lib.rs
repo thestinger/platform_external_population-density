@@ -136,21 +136,17 @@ pub fn get_parent_id(cell_id: u64, level: u32) -> u64 {
 
 /// Computes the bitwise S2 children IDs at the specified level (used by database builder).
 pub fn get_children_ids(cell_id: u64, level: u32) -> [u64; 4] {
-    assert!(cell_id != 0, "S2 cell ID cannot be 0");
-    let face = cell_id >> S2_FACE_SHIFT;
-    assert!(face < NUM_ROOT_FACES as u64, "Invalid S2 face ID: {}", face);
     assert!(
         level < MAX_S2_LEVEL,
         "S2 level must be < 30 to have children"
     );
-    let sentinel_position = MAX_S2_BITS - BITS_PER_LEVEL * level;
-    // Prevent underflow by ensuring cell ID is at least the sentinel value.
-    assert!(
-        cell_id >= (1u64 << sentinel_position),
-        "S2 cell ID must be greater than or equal to sentinel: cell_id = {}, sentinel = {}",
-        cell_id,
-        1u64 << sentinel_position
+    let cell_level = get_level(cell_id);
+    assert_eq!(
+        cell_level, level,
+        "cell level {} does not match requested level {}",
+        cell_level, level
     );
+    let sentinel_position = MAX_S2_BITS - BITS_PER_LEVEL * level;
     let prefix = cell_id & !(1u64 << sentinel_position);
     [
         prefix | (0u64 << (sentinel_position - 1)) | (1u64 << (sentinel_position - 2)),
