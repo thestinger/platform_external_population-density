@@ -168,9 +168,9 @@ fn main() -> Result<()> {
         validate_georeferencing(&mut georeference_decoder)?;
     }
 
-    let (tiff_path, _guard) = geotiff::prepare_geotiff(&arguments.tiff_path, "tmp.tif")?;
+    let prepared_tiff = geotiff::prepare_geotiff(&arguments.tiff_path)?;
 
-    let file = File::open(&tiff_path)?;
+    let file = File::open(prepared_tiff.path())?;
     let mut decoder = Decoder::new(BufReader::new(file))?.with_limits(Limits::unlimited());
 
     let (width, height) = decoder.dimensions()?;
