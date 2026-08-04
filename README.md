@@ -49,6 +49,12 @@ cargo run --release --package population-density-cli --bin verify_database
 
 The verifier checks canonical encoding, full and preverified construction, identical leaf reconstruction, and query results for all 134,217,726 valid S2 cells through level 12. Use `--quick` for a deterministic sample during local iteration.
 
+The benchmark measures warm-cache Rust query throughput with deterministic synthetic level 30 inputs:
+
+```bash
+cargo run --release --package population-density-cli --bin benchmark
+```
+
 ## Purpose
 
 The GrapheneOS population density provider uses on-device queries to select an S2 cell representing an estimated population of at least 1,000 people. Sparse locations therefore resolve to a coarser ancestor than dense locations.
